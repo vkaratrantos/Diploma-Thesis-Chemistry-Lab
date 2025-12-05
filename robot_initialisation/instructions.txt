@@ -1,0 +1,14 @@
+MyArm 300 Pi - Direct LAN Control (Bypass Mode)
+
+The file ros_lan_driver.py and the following procedure is used to connect the Elephant Robotics MyArm 300 Pi with a PC running ROS2 Humble.
+
+The main goal is to control the arm "bypassing" the Raspberry Pi's internal ROS. The PC runs ROS2 and the Raspberry Pi acts as a simple bridge/server over a LAN cable.
+
+ros_lan_driver.py: Runs on the PC and acts as the hardware driver.
+
+Network Setup 
+1. Connect the PC and the Robotic Arm directly using a LAN Cable.
+2. Set the PC's wired IPv4 address to : 192.168.123.10
+3. Set the Pi's wired IPv4 address to : 192.168.123.20
+
+(E
