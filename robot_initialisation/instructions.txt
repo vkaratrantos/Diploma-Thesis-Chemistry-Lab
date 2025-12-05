@@ -45,7 +45,7 @@ $ python3 ros_lan_driver.py
 
 Wait until you see the message that confirms the connection
 
-4. PC (Terminal 3 - The controller)
+4. PC (Terminal 3 - The Controller)
 
 With the driver running, you can finally control the robot.
 
