@@ -5,7 +5,7 @@ from pymycobot.myarm import MyArm
 import pigpio
 import time
 
-# --- ΡΥΘΜΙΣΕΙΣ ---
+# --- Settings ---
 PI_IP = '192.168.123.20'
 VIRTUAL_PORT = '/tmp/virtual_robot'
 GRIPPER_PIN = 18
@@ -13,25 +13,25 @@ GRIPPER_PIN = 18
 class LanDriver(Node):
     def __init__(self):
         super().__init__('lan_driver_node')
-        self.get_logger().info('--- LAN Driver: ΔΙΟΡΘΩΜΕΝΗ ΕΚΔΟΣΗ ---')
+        self.get_logger().info('LAN Driver')
 
-        # 1. Σύνδεση με Gripper (pigpio)
+        # 1. Connection with the Gripper (pigpio)
         try:
             self.pi = pigpio.pi(PI_IP, 8888)
             if not self.pi.connected: raise Exception("Pigpio connection failed")
-            self.get_logger().info('✅ Gripper Connected!')
+            self.get_logger().info('Gripper Connected!')
         except Exception as e:
-            self.get_logger().error(f'❌ Gripper Error: {e}')
+            self.get_logger().error(f'Gripper Error: {e}')
             exit()
 
-        # 2. Σύνδεση με Βραχίονα
+        # 2. Connection with the Arm
         try:
             self.mc = MyArm(VIRTUAL_PORT, 115200)
             time.sleep(1)
             self.mc.power_on()
-            self.get_logger().info('✅ Arm Connected!')
+            self.get_logger().info('Arm Connected!')
         except Exception as e:
-            self.get_logger().error(f'❌ Arm Error: {e}')
+            self.get_logger().error(f'Arm Error: {e}')
             exit()
 
         # 3. Subscriber
@@ -45,8 +45,7 @@ class LanDriver(Node):
 
     def listener_callback(self, msg):
         try:
-            # --- Α. ΒΡΑΧΙΟΝΑΣ (ΔΙΟΡΘΩΣΗ ΟΝΟΜΑΤΩΝ) ---
-            # Τα ονόματα όπως φαίνονται στην εικόνα του GUI σου
+            # --- Α. Arm ---
             target_joints = [
                 'joint1_to_base', 
                 'joint2_to_joint1', 
@@ -60,7 +59,6 @@ class LanDriver(Node):
             arm_angles = []
             found_all = True
             
-            # Ψάχνουμε τα σωστά ονόματα μέσα στο μήνυμα
             for name in target_joints:
                 if name in msg.name:
                     idx = msg.name.index(name)
@@ -68,11 +66,10 @@ class LanDriver(Node):
                 else:
                     found_all = False
             
-            # Στέλνουμε εντολή μόνο αν βρήκαμε και τα 7 joints
             if found_all and len(arm_angles) == 7:
                 self.mc.send_radians(arm_angles, 80)
 
-            # --- Β. GRIPPER (ΔΙΟΡΘΩΣΗ ΦΟΡΑΣ) ---
+            # --- Β. Gripper ---
             if 'endeffector_gripper' in msg.name:
                 idx = msg.name.index('endeffector_gripper')
                 val = msg.position[idx]
@@ -85,20 +82,13 @@ class LanDriver(Node):
             pass
 
     def move_gripper(self, radian_val):
-        # --- ΑΝΤΙΣΤΡΟΦΗ ΚΙΝΗΣΗΣ ---
-        # Το Slider δίνει τιμές από 0.0 έως -1.0 (ή περίπου εκεί)
-        # Χρησιμοποιούμε την απόλυτη τιμή (abs) για το ποσοστό
+        # The Slider has values between 0.0 and -1.0 
         
         percentage = abs(radian_val) / 1.57
         if percentage > 1.0: percentage = 1.0
         
         min_pulse = 500
         max_pulse = 2500
-        
-        # ΠΑΛΙΟΣ ΤΥΠΟΣ (Ανοίγει όταν αυξάνεται):
-        # pulse = min_pulse + (percentage * (max_pulse - min_pulse))
-        
-        # ΝΕΟΣ ΤΥΠΟΣ (Κλείνει όταν αυξάνεται - Ανάποδα):
         pulse = max_pulse - (percentage * (max_pulse - min_pulse))
         
         self.pi.set_servo_pulsewidth(GRIPPER_PIN, pulse)
