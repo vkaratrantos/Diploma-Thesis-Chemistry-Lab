@@ -1,3 +1,2 @@
-The "rack.stl" describes the rack where the test tubes are put.
-The "flange.stl" describes the flange that connects the joint7 and the Thorgripper.
-The
+The "flange.stl" file describes the flange that connects the joint7 and the Thorgripper.
+The "rack.stl" file describes the rack where the test tubes are put, but it is cut in the middle in order to be sliced.
