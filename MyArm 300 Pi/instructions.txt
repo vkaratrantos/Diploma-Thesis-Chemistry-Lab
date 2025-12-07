@@ -1,0 +1,7 @@
+If you want to use the modified workspace for the MyArm 300 Pi robot with the Thorgripper, you have to follow these instructions :
+
+1. Install and build the official Elephant Robotics workspace (https://github.com/elephantrobotics/mycobot_ros2). Make sure to install the select the branch correctly, according to your version (for me it's Humble).
+2. Replace the URDF folder in 'src/mycobot_ros2/mycobot_description/urdf/myarm_300_pi' with the URDF folder here.
+3. Correct the URDF filename and path in the launch files (if you have changed it).
+4. Build your workspace again.
+5. Launch one of the launch files.
