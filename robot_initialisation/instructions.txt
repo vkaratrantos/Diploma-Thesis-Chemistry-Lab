@@ -24,7 +24,7 @@ SSH into the Raspberry Pi (or use a monitor and a keyboard) and run these comman
 $ sudo pigpiod
 
 # Forward the Serial Port to the Network (Port 8889)
-$ socat TCP-LISTEN:8889,fork,reuseaddr FILE:/dev/ttyAMA0,b1000000,raw,echo=0
+$ socat TCP-LISTEN:8889,fork,reuseaddr FILE:/dev/ttyAMA0,b115200,raw,echo=0
 
 2. PC (Terminal 1 - Virtual Connection)
 
