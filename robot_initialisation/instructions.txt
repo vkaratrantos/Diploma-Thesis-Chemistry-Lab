@@ -41,11 +41,16 @@ Navigate to the folder containing ros_lan_driver.py and run the file.
 Example:
 
 $ cd ~/my_robot
-$ python3 ros_lan_driver.py
+$ python3 ros_lan_driver.py --ros-args -r joint_states:=/hardware_joints
 
 Wait until you see the message that confirms the connection
 
-4. PC (Terminal 3 - The Controller)
+4. PC (Terminal 3 - Driver 2)
+
+$ cd ~/my_robot
+$ python3 moveit_bridge_2.py
+
+5. PC (Terminal 4 - The Controller)
 
 With the driver running, you can finally control the robot.
 
