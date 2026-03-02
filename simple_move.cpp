@@ -54,7 +54,7 @@ int main(int argc, char * argv[])
   arm_interface.setMaxVelocityScalingFactor(0.3); 
   arm_interface.setMaxAccelerationScalingFactor(0.3);
 
-  // --- ΠΡΟΣΘΗΚΗ ΠΑΤΩΜΑΤΟΣ ---
+  // --- Adding the floor as collision ---
   moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
   moveit_msgs::msg::CollisionObject collision_object;
   collision_object.header.frame_id = arm_interface.getPlanningFrame();
@@ -69,19 +69,26 @@ int main(int argc, char * argv[])
   collision_object.operation = collision_object.ADD;
   planning_scene_interface.applyCollisionObjects({collision_object});
 
-  // --- 1. ΕΥΕΛΙΚΤΗ ΜΕΤΑΒΑΣΗ (ΓΙΑ ΠΡΟΣΕΓΓΙΣΗ ΣΤΟΧΩΝ X, Y) ---
+  // --- 1. Cartesian Path to the Target (with 0.5cm tolerance) ---
   auto try_direct_cartesian = [&](double target_x, double target_y, double target_z) -> bool {
-      std::vector<double> offsets = {0.0, 0.01, -0.01};
+      // Offsets in meters: 0mm, 2.5mm, 5mm, -2.5mm, -5mm to give it options
+      std::vector<double> offsets = {0.0, 0.0025, -0.0025, 0.005, -0.005};
       moveit_msgs::msg::RobotTrajectory traj;
       geometry_msgs::msg::Pose current_pose = arm_interface.getCurrentPose().pose;
 
       for (double dx : offsets) {
           for (double dy : offsets) {
               for (double dz : offsets) {
+                  // Strict check: Ensure the 3D distance of the offset is maximum 0.5 cm (0.005 meters)
+                  double distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+                  if (distance > 0.0051) continue; 
+
                   geometry_msgs::msg::Pose target;
                   target.position.x = target_x + dx;
                   target.position.y = target_y + dy;
                   target.position.z = target_z + dz;
+                  
+                  // Διατηρούμε αυστηρά κάθετο προσανατολισμό
                   target.orientation = current_pose.orientation;
 
                   std::vector<geometry_msgs::msg::Pose> waypoints = {target};
@@ -91,18 +98,24 @@ int main(int argc, char * argv[])
                       moveit::planning_interface::MoveGroupInterface::Plan plan;
                       plan.trajectory_ = traj;
                       arm_interface.execute(plan);
+                      
+                      if (distance > 0.0) {
+                          std::cout << "    [+] Βρέθηκε διαδρομή με μικρή απόκλιση: X=" 
+                                    << target.position.x << ", Y=" << target.position.y 
+                                    << ", Z=" << target.position.z << std::endl;
+                      }
                       return true;
                   }
               }
           }
       }
-      std::cout << "    [-] Αποτυχία μετακίνησης στο σημείο." << std::endl;
+      std::cout << "    [-] Αποτυχία εύρεσης καρτεσιανής διαδρομής ακόμα και εντός ανοχής 0.5 cm." << std::endl;
       return false;
   };
 
-  // --- 2. ΑΥΣΤΗΡΗ ΚΑΘΕΤΗ ΚΙΝΗΣΗ ---
+  // --- 2. Vertical Move ---
   auto strict_vertical_move = [&](double delta_z) -> bool {
-      std::cout << "    [STRICT VERTICAL] Κίνηση Z κατά " << delta_z * 100 << " cm..." << std::endl;
+      std::cout << "    [Vertical Move] Moving vertically " << delta_z * 100 << " cm..." << std::endl;
       
       geometry_msgs::msg::Pose target_pose = arm_interface.getCurrentPose().pose;
       target_pose.position.z += delta_z; 
@@ -118,69 +131,49 @@ int main(int argc, char * argv[])
           arm_interface.execute(plan); 
           return true;
       } else {
-          std::cout << "    [-] Αποτυχία αυστηρής κάθετης κίνησης (Ασφαλές Μπλοκάρισμα)." << std::endl;
+          std::cout << "    [-] Failed to move vertically." << std::endl;
           return false;
       }
   };
 
-  // --- 3. ΝΕΑ ΣΥΝΑΡΤΗΣΗ: ΤΟΠΙΚΗ ΠΕΡΙΣΤΡΟΦΗ ΜΕ QUATERNIONS (ΑΠΟΣΟΒΗΣΗ GIMBAL LOCK) ---
-  auto strict_rotation_move = [&](double delta_roll) -> bool {
-      std::cout << "    [STRICT ROTATION] Τοπική περιστροφή Roll κατά " << delta_roll * 180.0 / M_PI << " μοίρες..." << std::endl;
-      
-      geometry_msgs::msg::Pose target_pose = arm_interface.getCurrentPose().pose;
-      
-      // Διαβάζουμε τον τρέχοντα προσανατολισμό κατευθείαν ως Quaternion
-      tf2::Quaternion q_current(target_pose.orientation.x, target_pose.orientation.y, target_pose.orientation.z, target_pose.orientation.w);
-      
-      std::vector<geometry_msgs::msg::Pose> waypoints;
+  // --- 3. Rotating the last joint ---
+  auto rotate_last_joint = [&](double delta_angle) -> bool {
+      std::cout << "    [JOINT ROTATION] Rotating the last joint by " 
+                << delta_angle * 180.0 / M_PI << " degrees." << std::endl;
 
-      // Σπάμε τη μεγάλη περιστροφή σε 5 ομαλά ενδιάμεσα βήματα (waypoints)
-      int steps = 5;
-      for (int i = 1; i <= steps; ++i) {
-          double step_delta = delta_roll * i / steps; 
-          
-          // Δημιουργούμε την "καθαρή" τοπική περιστροφή γύρω από τον άξονα X (Roll)
-          tf2::Quaternion q_rot;
-          q_rot.setRPY(step_delta, 0.0, 0.0);
-          
-          // Πολλαπλασιάζουμε τα Quaternions για να εφαρμόσουμε την περιστροφή ΣΤΟ ΤΟΠΙΚΟ ΣΥΣΤΗΜΑ της αρπάγης
-          tf2::Quaternion q_step = q_current * q_rot;
-          q_step.normalize(); // Κανονικοποίηση για αποφυγή μαθηματικών σφαλμάτων
-          
-          geometry_msgs::msg::Pose wp = target_pose;
-          wp.orientation.x = q_step.x();
-          wp.orientation.y = q_step.y();
-          wp.orientation.z = q_step.z();
-          wp.orientation.w = q_step.w();
-          
-          waypoints.push_back(wp);
+      std::vector<double> joint_values = arm_interface.getCurrentJointValues();
+
+      if (joint_values.empty()) {
+          std::cout << "    [-] Error: Joint values not found!" << std::endl;
+          return false;
       }
 
-      moveit_msgs::msg::RobotTrajectory traj;
-      
-      // Υπολογισμός Καρτεσιανής Διαδρομής πάνω στα 5 βήματα
-      double fraction = arm_interface.computeCartesianPath(waypoints, 0.005, 0.0, traj);
+      int last_joint_index = joint_values.size() - 1;
+      joint_values[last_joint_index] += delta_angle;
 
-      if (fraction >= 0.99) { 
-          moveit::planning_interface::MoveGroupInterface::Plan plan;
-          plan.trajectory_ = traj;
-          arm_interface.execute(plan); 
+      arm_interface.setJointValueTarget(joint_values);
+
+      moveit::planning_interface::MoveGroupInterface::Plan plan;
+      bool success = (arm_interface.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+
+      if (success) {
+          arm_interface.execute(plan);
           return true;
       } else {
-          std::cout << "    [-] Αποτυχία. Ο καρπός μάλλον χτυπάει μηχανικό όριο!" << std::endl;
+          std::cout << "    [-] Error. The joint hits a joint limit!" << std::endl;
           return false;
       }
   };
 
-  RCLCPP_INFO(node->get_logger(), "Εκκίνηση διαδικασίας...");
+  RCLCPP_INFO(node->get_logger(), "Starting the procedure...");
 
-  std::cout << ">>> Μετάβαση σε Home (-0.15, -0.2, 0.2) με ΚΑΘΕΤΟ προσανατολισμό..." << std::endl;
+  std::cout << ">>> Heading to Home Position (-0.15, -0.2, 0.2) with vertical orientation..." << std::endl;
   arm_interface.clearPoseTargets();
   
   geometry_msgs::msg::Pose home_pose;
   home_pose.position.x = -0.15;
   home_pose.position.y = -0.2;
-  home_pose.position.z = 0.2;
+  home_pose.position.z = 0.25;
 
   tf2::Quaternion q_home;
   q_home.setRPY(M_PI, -M_PI/2.0, -M_PI/2.0);
@@ -191,17 +184,17 @@ int main(int argc, char * argv[])
 
   arm_interface.setPoseTarget(home_pose);
   if (arm_interface.move() != moveit::core::MoveItErrorCode::SUCCESS) {
-      RCLCPP_ERROR(node->get_logger(), "Αποτυχία μετάβασης στην αρχική θέση!");
+      RCLCPP_ERROR(node->get_logger(), "Failed to go to Home Position!");
   }
 
-  std::cout << ">>> Σύστημα Έτοιμο." << std::endl;
+  std::cout << ">>> The system is ready." << std::endl;
 
   while (rclcpp::ok()) {
     std::cout << "\n================================================" << std::endl;
     arm_interface.setStartStateToCurrentState();
     printPose(arm_interface.getCurrentPose().pose);
 
-    std::cout << "Εντολές: M <id>, P (Pick), D (Drop), pour (Pour), O (Open), C (Close)\nΕντολή: ";
+    std::cout << "Commands: M <id>, P (Pick), D (Drop), pour (Pour), O (Open), C (Close)\nCommand: ";
     std::string line;
     std::getline(std::cin, line);
     if (line.empty()) continue;
@@ -209,7 +202,7 @@ int main(int argc, char * argv[])
     if (line == "O" || line == "o") { gripper_interface.setNamedTarget("open"); gripper_interface.move(); continue; } 
     if (line == "C" || line == "c") { gripper_interface.setNamedTarget("closed"); gripper_interface.move(); continue; }
 
-    // --- ΕΝΤΟΛΗ: ΜΕΤΑΒΑΣΗ ΣΕ MARKER ---
+    // --- Command: Going to Marker ---
     if (line[0] == 'M' || line[0] == 'm') {
         int marker_id;
         std::stringstream ss(line.substr(1));
@@ -223,20 +216,18 @@ int main(int argc, char * argv[])
                     planning_frame, target_frame, tf2::TimePointZero, std::chrono::seconds(1)
                 );
 
-                double target_x = t.transform.translation.x + 0.02; // Προεπιλογή +2 cm X
-                double target_y = t.transform.translation.y + 0.15; // Προεπιλογή +15 cm Y
-                double target_z = 0.20;                             // Προεπιλογή 20 cm Z
+                // Αφαίρεση των offsets σε X και Y. Ορίζουμε αυστηρά το Z στα 20 cm.
+                double target_x = t.transform.translation.x; 
+                double target_y = t.transform.translation.y; 
+                double target_z = 0.25;                             
 
-                // --- ΕΙΔΙΚΟΣ ΚΑΝΟΝΑΣ ΓΙΑ MARKER 4 ---
-                if (marker_id == 4) {
-                    target_x = t.transform.translation.x + 0.08; // Ειδικό offset X +8 cm
-                    target_z = 0.20;                             // 20 cm πάνω από το έδαφος
-                    std::cout << "\n>>> [Ειδικός Κανόνας ID 4] Εφαρμογή Offsets (X+0.08, Y+0.15, Z=0.20)..." << std::endl;
-                } else {
-                    std::cout << "\n>>> Εντοπίστηκε το Marker " << marker_id << ". Εφαρμογή Κανονικών Offsets..." << std::endl;
+                std::cout << "\n>>> Εντοπίστηκε το Marker " << marker_id 
+                          << ". Στόχος: X=" << target_x << ", Y=" << target_y << ", Z=" << target_z << std::endl;
+
+                // Απευθείας δοκιμή (συμπεριλαμβάνει αυτόματα την ανοχή 0.5 cm εσωτερικά)
+                if (!try_direct_cartesian(target_x, target_y, target_z)) {
+                    std::cout << "    [-] Αποτυχία μετακίνησης στο σημείο." << std::endl;
                 }
-
-                try_direct_cartesian(target_x, target_y, target_z);
 
             } catch (const tf2::TransformException & ex) {
                 std::cout << "\n[-] ΣΦΑΛΜΑ: Το Marker " << marker_id << " δεν φαίνεται." << std::endl;
@@ -247,18 +238,16 @@ int main(int argc, char * argv[])
 
     // --- ΕΝΤΟΛΗ: POUR (Άδειασμα) ---
     if (line == "pour" || line == "POUR" || line == "Pour") {
-        std::cout << "\n>>> ΕΚΤΕΛΕΣΗ POUR (ΠΕΡΙΣΤΡΟΦΗ END-EFFECTOR)..." << std::endl;
+        std::cout << "\n>>> ΕΚΤΕΛΕΣΗ POUR (ΠΕΡΙΣΤΡΟΦΗ ΜΟΝΟ ΤΕΛΕΥΤΑΙΑΣ ΑΡΘΡΩΣΗΣ)..." << std::endl;
         
-        std::cout << ">>> 1. Γύρισμα καρπού 90 μοίρες (Roll)..." << std::endl;
-        // Το -M_PI/2.0 όπως είχες βρει ότι δουλεύει για τα όρια του δικού σου ρομπότ
-        if(strict_rotation_move(-M_PI / 2.0)) { 
+        std::cout << ">>> 1. Γύρισμα καρπού 90 μοίρες (Αριστερόστροφα / CCW)..." << std::endl;
+        if(rotate_last_joint(M_PI / 2.0)) { 
             
             std::cout << ">>> [Αναμονή 1.5 δευτερόλεπτο για άδειασμα του υγρού/υλικού]..." << std::endl;
             std::this_thread::sleep_for(std::chrono::milliseconds(1500));
             
-            std::cout << ">>> 2. Επαναφορά καρπού (Ίσιωμα)..." << std::endl;
-            // Η επαναφορά γίνεται με το αντίθετο πρόσημο
-            strict_rotation_move(M_PI / 2.0); 
+            std::cout << ">>> 2. Επαναφορά καρπού (Δεξιόστροφα / CW)..." << std::endl;
+            rotate_last_joint(-M_PI / 2.0); 
             
             std::cout << ">>> Η διαδικασία Pour ολοκληρώθηκε επιτυχώς!" << std::endl;
         }
