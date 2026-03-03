@@ -50,7 +50,8 @@ int main(int argc, char * argv[])
   using moveit::planning_interface::MoveGroupInterface;
   MoveGroupInterface arm_interface(node, "arm_group"); 
   MoveGroupInterface gripper_interface(node, "gripper"); 
-
+  
+  arm_interface.setPlanningTime(1.0);
   arm_interface.setMaxVelocityScalingFactor(0.3); 
   arm_interface.setMaxAccelerationScalingFactor(0.3);
 
@@ -92,7 +93,7 @@ int main(int argc, char * argv[])
                   target.orientation = current_pose.orientation;
 
                   std::vector<geometry_msgs::msg::Pose> waypoints = {target};
-                  double fraction = arm_interface.computeCartesianPath(waypoints, 0.01, 0.0, traj);
+                  double fraction = arm_interface.computeCartesianPath(waypoints, 0.01, 1.5, traj);
 
                   if (fraction >= 0.95) {
                       moveit::planning_interface::MoveGroupInterface::Plan plan;
@@ -109,7 +110,6 @@ int main(int argc, char * argv[])
               }
           }
       }
-      std::cout << "    [-] Αποτυχία εύρεσης καρτεσιανής διαδρομής ακόμα και εντός ανοχής 0.5 cm." << std::endl;
       return false;
   };
 
@@ -123,7 +123,7 @@ int main(int argc, char * argv[])
       std::vector<geometry_msgs::msg::Pose> waypoints = {target_pose};
       moveit_msgs::msg::RobotTrajectory traj;
       
-      double fraction = arm_interface.computeCartesianPath(waypoints, 0.005, 0.0, traj);
+      double fraction = arm_interface.computeCartesianPath(waypoints, 0.005, 1.5, traj);
 
       if (fraction >= 0.99) { 
           moveit::planning_interface::MoveGroupInterface::Plan plan;
@@ -167,13 +167,13 @@ int main(int argc, char * argv[])
 
   RCLCPP_INFO(node->get_logger(), "Starting the procedure...");
 
-  std::cout << ">>> Heading to Home Position (-0.15, -0.2, 0.2) with vertical orientation..." << std::endl;
+  std::cout << ">>> Heading to Home Position (-0.15, -0.2, 0.25) with vertical orientation..." << std::endl;
   arm_interface.clearPoseTargets();
   
   geometry_msgs::msg::Pose home_pose;
   home_pose.position.x = -0.15;
   home_pose.position.y = -0.2;
-  home_pose.position.z = 0.25;
+  home_pose.position.z = 0.25; // Ενημερώθηκε και το Home στο νέο ύψος (25 cm)
 
   tf2::Quaternion q_home;
   q_home.setRPY(M_PI, -M_PI/2.0, -M_PI/2.0);
@@ -202,7 +202,7 @@ int main(int argc, char * argv[])
     if (line == "O" || line == "o") { gripper_interface.setNamedTarget("open"); gripper_interface.move(); continue; } 
     if (line == "C" || line == "c") { gripper_interface.setNamedTarget("closed"); gripper_interface.move(); continue; }
 
-    // --- Command: Going to Marker ---
+    // --- Command: Going to Marker with Bridge Fallbacks ---
     if (line[0] == 'M' || line[0] == 'm') {
         int marker_id;
         std::stringstream ss(line.substr(1));
@@ -212,25 +212,66 @@ int main(int argc, char * argv[])
             std::string planning_frame = arm_interface.getPlanningFrame();
 
             try {
+                // 1. Βρίσκουμε τον τελικό στόχο
                 geometry_msgs::msg::TransformStamped t = tf_buffer->lookupTransform(
                     planning_frame, target_frame, tf2::TimePointZero, std::chrono::seconds(1)
                 );
 
-                // Αφαίρεση των offsets σε X και Y. Ορίζουμε αυστηρά το Z στα 20 cm.
                 double target_x = t.transform.translation.x; 
                 double target_y = t.transform.translation.y; 
-                double target_z = 0.25;                             
+                double target_z = 0.25; // Ύψος ασφαλείας 25 cm                           
 
                 std::cout << "\n>>> Εντοπίστηκε το Marker " << marker_id 
                           << ". Στόχος: X=" << target_x << ", Y=" << target_y << ", Z=" << target_z << std::endl;
 
-                // Απευθείας δοκιμή (συμπεριλαμβάνει αυτόματα την ανοχή 0.5 cm εσωτερικά)
+                // 2. Δοκιμάζουμε την απευθείας διαδρομή
                 if (!try_direct_cartesian(target_x, target_y, target_z)) {
-                    std::cout << "    [-] Αποτυχία μετακίνησης στο σημείο." << std::endl;
+                    std::cout << "    [-] Αποτυχία απευθείας μετάβασης. Δοκιμή μέσω κεντρικών Markers (Bridge)..." << std::endl;
+                    
+                    // Λίστα με "κεντρικά" markers που λειτουργούν καλά ως γέφυρες (π.χ. 3, 0, 2)
+                    std::vector<int> fallback_markers = {3, 0, 2}; 
+                    bool success_via_bridge = false;
+
+                    for (int bridge_id : fallback_markers) {
+                        if (bridge_id == marker_id) continue; // Αν ο στόχος είναι η γέφυρα, την προσπερνάμε
+
+                        std::string bridge_frame = (bridge_id == 0) ? "marker_base" : "marker_" + std::to_string(bridge_id);
+                        try {
+                            geometry_msgs::msg::TransformStamped t_bridge = tf_buffer->lookupTransform(
+                                planning_frame, bridge_frame, tf2::TimePointZero, std::chrono::milliseconds(200)
+                            );
+                            
+                            double bridge_x = t_bridge.transform.translation.x;
+                            double bridge_y = t_bridge.transform.translation.y;
+                            double bridge_z = 0.25;
+
+                            std::cout << "    [BRIDGE] Δοκιμή μετάβασης στο ενδιάμεσο Marker " << bridge_id << "..." << std::endl;
+                            
+                            // Αν καταφέρει να πάει στη γέφυρα...
+                            if (try_direct_cartesian(bridge_x, bridge_y, bridge_z)) {
+                                std::cout << "    [BRIDGE] Επιτυχία! Τώρα προσπάθεια για τον τελικό στόχο (Marker " << marker_id << ")..." << std::endl;
+                                
+                                // ...δοκιμάζει ξανά να πάει στον τελικό στόχο
+                                if (try_direct_cartesian(target_x, target_y, target_z)) {
+                                    success_via_bridge = true;
+                                    break; // Πετύχαμε! Βγαίνουμε από το for-loop
+                                } else {
+                                    std::cout << "    [BRIDGE] Αποτυχία από τη γέφυρα προς τον στόχο. Θα δοκιμαστεί άλλη εναλλακτική." << std::endl;
+                                }
+                            }
+                        } catch (const tf2::TransformException & ex) {
+                            // Αν δεν βλέπει το bridge marker, απλά το προσπερνάει
+                            continue; 
+                        }
+                    }
+
+                    if (!success_via_bridge) {
+                        std::cout << "    [-] Τελική Αποτυχία. Δεν βρέθηκε διαδρομή ούτε μέσω ενδιάμεσων Markers." << std::endl;
+                    }
                 }
 
             } catch (const tf2::TransformException & ex) {
-                std::cout << "\n[-] ΣΦΑΛΜΑ: Το Marker " << marker_id << " δεν φαίνεται." << std::endl;
+                std::cout << "\n[-] ΣΦΑΛΜΑ: Το Marker " << marker_id << " δεν φαίνεται στην κάμερα." << std::endl;
             }
         }
         continue;
@@ -263,7 +304,7 @@ int main(int argc, char * argv[])
         gripper_interface.move(); 
         
         std::cout << ">>> 2. Αυστηρή Κάθοδος 10 cm..." << std::endl;
-        if(strict_vertical_move(-0.10)) { 
+        if(strict_vertical_move(-0.15)) { 
             
             std::cout << ">>> [Αναμονή 1 δευτερόλεπτο για σταθεροποίηση]..." << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -275,7 +316,7 @@ int main(int argc, char * argv[])
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
             std::cout << ">>> 4. Αυστηρή Άνοδος 10 cm..." << std::endl;
-            strict_vertical_move(0.10); 
+            strict_vertical_move(0.15); 
             
             std::cout << ">>> Το Pick ολοκληρώθηκε!" << std::endl;
         }
@@ -287,7 +328,7 @@ int main(int argc, char * argv[])
         std::cout << "\n>>> ΕΚΤΕΛΕΣΗ DROP/PLACE (ΣΤΗΝ ΤΡΕΧΟΥΣΑ ΘΕΣΗ X, Y)..." << std::endl;
         
         std::cout << ">>> 1. Αυστηρή Κάθοδος 10 cm..." << std::endl;
-        if(strict_vertical_move(-0.10)) { 
+        if(strict_vertical_move(-0.15)) { 
             
             std::cout << ">>> [Αναμονή 1 δευτερόλεπτο για σταθεροποίηση]..." << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -299,7 +340,7 @@ int main(int argc, char * argv[])
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             
             std::cout << ">>> 3. Αυστηρή Άνοδος 10 cm..." << std::endl;
-            strict_vertical_move(0.10); 
+            strict_vertical_move(0.15); 
 
             std::cout << ">>> 4. Κλείσιμο Gripper..." << std::endl;
             gripper_interface.setNamedTarget("closed"); 
