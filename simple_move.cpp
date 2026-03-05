@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <cmath>
 #include <chrono>
+#include <algorithm> 
 
 #include <rclcpp/rclcpp.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
@@ -70,50 +71,83 @@ int main(int argc, char * argv[])
   collision_object.operation = collision_object.ADD;
   planning_scene_interface.applyCollisionObjects({collision_object});
 
-  // --- 1. Cartesian Path to the Target (with 0.5cm tolerance) ---
-  auto try_direct_cartesian = [&](double target_x, double target_y, double target_z) -> bool {
-      // Offsets in meters: 0mm, 2.5mm, 5mm, -2.5mm, -5mm to give it options
-      std::vector<double> offsets = {0.0, 0.0025, -0.0025, 0.005, -0.005};
-      moveit_msgs::msg::RobotTrajectory traj;
-      geometry_msgs::msg::Pose current_pose = arm_interface.getCurrentPose().pose;
+  // --- 1. CARTESIAN PATH WITH Z-SWEEP, XY-TOLERANCE, AND ROLL-SWEEP ---
+  auto try_direct_cartesian = [&](double target_x, double target_y) -> bool {
+    geometry_msgs::msg::Pose current_pose = arm_interface.getCurrentPose().pose;
+    double current_z = current_pose.position.z;
 
-      for (double dx : offsets) {
-          for (double dy : offsets) {
-              for (double dz : offsets) {
-                  // Strict check: Ensure the 3D distance of the offset is maximum 0.5 cm (0.005 meters)
-                  double distance = std::sqrt(dx*dx + dy*dy + dz*dz);
-                  if (distance > 0.0051) continue; 
+    // 1. Generate heights from 20cm to 30cm in 2cm steps, sorted by current height
+    std::vector<double> z_heights;
+    for (double z = 0.20; z <= 0.3001; z += 0.02) {
+        z_heights.push_back(z);
+    }
+    std::sort(z_heights.begin(), z_heights.end(), [current_z](double a, double b) {
+        return std::abs(a - current_z) < std::abs(b - current_z);
+    });
 
-                  geometry_msgs::msg::Pose target;
-                  target.position.x = target_x + dx;
-                  target.position.y = target_y + dy;
-                  target.position.z = target_z + dz;
-                  
-                  // Διατηρούμε αυστηρά κάθετο προσανατολισμό
-                  target.orientation = current_pose.orientation;
+    // 2. Fast "Cross" pattern XY offsets: Center, +X, -X, +Y, -Y at 5mm
+    struct Offset { double dx; double dy; };
+    std::vector<Offset> xy_offsets = {
+        {0.0, 0.0}, {0.005, 0.0}, {-0.005, 0.0}, {0.0, 0.005}, {0.0, -0.005}
+    };
 
-                  std::vector<geometry_msgs::msg::Pose> waypoints = {target};
-                  double fraction = arm_interface.computeCartesianPath(waypoints, 0.01, 1.5, traj);
+    // 3. Roll Offsets (Wrist spin): 0°, +30°, -30°, +60°, -60° in radians
+    std::vector<double> roll_offsets = {0.0, 0.523, -0.523, 1.047, -1.047};
+    
+    moveit_msgs::msg::RobotTrajectory traj;
 
-                  if (fraction >= 0.95) {
-                      moveit::planning_interface::MoveGroupInterface::Plan plan;
-                      plan.trajectory_ = traj;
-                      arm_interface.execute(plan);
-                      
-                      if (distance > 0.0) {
-                          std::cout << "    [+] Βρέθηκε διαδρομή με μικρή απόκλιση: X=" 
-                                    << target.position.x << ", Y=" << target.position.y 
-                                    << ", Z=" << target.position.z << std::endl;
-                      }
-                      return true;
-                  }
-              }
-          }
-      }
-      return false;
+    for (double test_z : z_heights) {
+        for (const auto& offset : xy_offsets) {
+            for (double roll_off : roll_offsets) {
+                geometry_msgs::msg::Pose target;
+                target.position.x = target_x + offset.dx;
+                target.position.y = target_y + offset.dy;
+                target.position.z = test_z; 
+
+                // --- Calculate the new wrist angle mathematically ---
+                tf2::Quaternion q_current(
+                    current_pose.orientation.x, current_pose.orientation.y, 
+                    current_pose.orientation.z, current_pose.orientation.w
+                );
+                
+                tf2::Quaternion q_rot;
+                q_rot.setRPY(roll_off, 0, 0); // Apply Roll twist
+                
+                tf2::Quaternion q_target = q_current * q_rot; // Combine them
+                q_target.normalize();
+
+                target.orientation.x = q_target.x();
+                target.orientation.y = q_target.y();
+                target.orientation.z = q_target.z();
+                target.orientation.w = q_target.w();
+
+                std::vector<geometry_msgs::msg::Pose> waypoints = {target};
+                
+                // Use computeCartesianPath! Perfectly straight lines, no OMPL chaos.
+                double fraction = arm_interface.computeCartesianPath(waypoints, 0.02, 1.5, traj);
+
+                if (fraction >= 0.95) {
+                    moveit::planning_interface::MoveGroupInterface::Plan plan;
+                    plan.trajectory_ = traj;
+                    
+                    if (arm_interface.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                        double distance_xy = std::sqrt(offset.dx*offset.dx + offset.dy*offset.dy);
+                        std::cout << "    [+] Επιτυχία! Ύψος: " << test_z * 100 
+                                  << " cm | Απόκλιση XY: " << distance_xy * 1000 
+                                  << " mm | Καρπός (Roll): " << roll_off * 180.0 / M_PI << "°" << std::endl;
+                        return true;
+                    } else {
+                        std::cout << "    [-] Η διαδρομή βρέθηκε αλλά απέτυχε η εκτέλεση. Δοκιμή επόμενης..." << std::endl;
+                    }
+                }
+            }
+        }
+    }
+    
+    return false; 
   };
 
-// --- 2. Vertical Move (with 0.5cm tolerance) ---
+  // --- 2. Strict Vertical Move for Pick/Drop ---
   auto strict_vertical_move = [&](double delta_z) -> bool {
       std::cout << "    [Vertical Move] Moving vertically " << delta_z * 100 << " cm..." << std::endl;
       
@@ -124,7 +158,6 @@ int main(int argc, char * argv[])
       for (double dx : offsets) {
           for (double dy : offsets) {
               for (double dz_offset : offsets) {
-                  // Strict check: Ensure the 3D distance of the offset is maximum 0.5 cm
                   double distance = std::sqrt(dx*dx + dy*dy + dz_offset*dz_offset);
                   if (distance > 0.0051) continue;
 
@@ -135,7 +168,6 @@ int main(int argc, char * argv[])
 
                   std::vector<geometry_msgs::msg::Pose> waypoints = {target_pose};
                   
-                  // Keep your 0.005 step size and the 1.5 jump_threshold
                   double fraction = arm_interface.computeCartesianPath(waypoints, 0.005, 1.5, traj);
 
                   if (fraction >= 0.99) { 
@@ -194,7 +226,7 @@ int main(int argc, char * argv[])
   geometry_msgs::msg::Pose home_pose;
   home_pose.position.x = -0.15;
   home_pose.position.y = -0.2;
-  home_pose.position.z = 0.25; // Ενημερώθηκε και το Home στο νέο ύψος (25 cm)
+  home_pose.position.z = 0.25; 
 
   tf2::Quaternion q_home;
   q_home.setRPY(M_PI, -M_PI/2.0, -M_PI/2.0);
@@ -215,7 +247,7 @@ int main(int argc, char * argv[])
     arm_interface.setStartStateToCurrentState();
     printPose(arm_interface.getCurrentPose().pose);
 
-    std::cout << "Commands: M <id>, P (Pick), D (Drop), pour (Pour), O (Open), C (Close)\nCommand: ";
+    std::cout << "Commands: M <id>, P (Pick), D (Drop), pour (Pour), O (Open), C (Close), <X> <Y> (Go to coordinates)\nCommand: ";
     std::string line;
     std::getline(std::cin, line);
     if (line.empty()) continue;
@@ -223,7 +255,7 @@ int main(int argc, char * argv[])
     if (line == "O" || line == "o") { gripper_interface.setNamedTarget("open"); gripper_interface.move(); continue; } 
     if (line == "C" || line == "c") { gripper_interface.setNamedTarget("closed"); gripper_interface.move(); continue; }
 
-    // --- Command: Going to Marker with Bridge Fallbacks ---
+    // --- Command: Going to Marker ---
     if (line[0] == 'M' || line[0] == 'm') {
         int marker_id;
         std::stringstream ss(line.substr(1));
@@ -233,28 +265,25 @@ int main(int argc, char * argv[])
             std::string planning_frame = arm_interface.getPlanningFrame();
 
             try {
-                // 1. Βρίσκουμε τον τελικό στόχο
                 geometry_msgs::msg::TransformStamped t = tf_buffer->lookupTransform(
                     planning_frame, target_frame, tf2::TimePointZero, std::chrono::seconds(1)
                 );
 
                 double target_x = t.transform.translation.x; 
                 double target_y = t.transform.translation.y; 
-                double target_z = 0.25; // Ύψος ασφαλείας 25 cm                           
 
                 std::cout << "\n>>> Εντοπίστηκε το Marker " << marker_id 
-                          << ". Στόχος: X=" << target_x << ", Y=" << target_y << ", Z=" << target_z << std::endl;
+                          << ". Στόχος: X=" << target_x << ", Y=" << target_y << std::endl;
 
-                // 2. Δοκιμάζουμε την απευθείας διαδρομή
-                if (!try_direct_cartesian(target_x, target_y, target_z)) {
+                // Call the updated Cartesian function
+                if (!try_direct_cartesian(target_x, target_y)) {
                     std::cout << "    [-] Αποτυχία απευθείας μετάβασης. Δοκιμή μέσω κεντρικών Markers (Bridge)..." << std::endl;
                     
-                    // Λίστα με "κεντρικά" markers που λειτουργούν καλά ως γέφυρες (π.χ. 3, 0, 2)
                     std::vector<int> fallback_markers = {3, 0, 2}; 
                     bool success_via_bridge = false;
 
                     for (int bridge_id : fallback_markers) {
-                        if (bridge_id == marker_id) continue; // Αν ο στόχος είναι η γέφυρα, την προσπερνάμε
+                        if (bridge_id == marker_id) continue; 
 
                         std::string bridge_frame = (bridge_id == 0) ? "marker_base" : "marker_" + std::to_string(bridge_id);
                         try {
@@ -264,24 +293,20 @@ int main(int argc, char * argv[])
                             
                             double bridge_x = t_bridge.transform.translation.x;
                             double bridge_y = t_bridge.transform.translation.y;
-                            double bridge_z = 0.25;
 
                             std::cout << "    [BRIDGE] Δοκιμή μετάβασης στο ενδιάμεσο Marker " << bridge_id << "..." << std::endl;
                             
-                            // Αν καταφέρει να πάει στη γέφυρα...
-                            if (try_direct_cartesian(bridge_x, bridge_y, bridge_z)) {
+                            if (try_direct_cartesian(bridge_x, bridge_y)) {
                                 std::cout << "    [BRIDGE] Επιτυχία! Τώρα προσπάθεια για τον τελικό στόχο (Marker " << marker_id << ")..." << std::endl;
                                 
-                                // ...δοκιμάζει ξανά να πάει στον τελικό στόχο
-                                if (try_direct_cartesian(target_x, target_y, target_z)) {
+                                if (try_direct_cartesian(target_x, target_y)) {
                                     success_via_bridge = true;
-                                    break; // Πετύχαμε! Βγαίνουμε από το for-loop
+                                    break; 
                                 } else {
                                     std::cout << "    [BRIDGE] Αποτυχία από τη γέφυρα προς τον στόχο. Θα δοκιμαστεί άλλη εναλλακτική." << std::endl;
                                 }
                             }
                         } catch (const tf2::TransformException & ex) {
-                            // Αν δεν βλέπει το bridge marker, απλά το προσπερνάει
                             continue; 
                         }
                     }
@@ -372,9 +397,18 @@ int main(int argc, char * argv[])
         continue;
     }
 
-    // --- ΕΝΤΟΛΗ: ΑΠΛΗ ΜΕΤΑΒΑΣΗ ---
-    std::stringstream ss(line); double tx, ty, tz;
-    if (ss >> tx >> ty >> tz) try_direct_cartesian(tx, ty, tz);
+    // --- ΕΝΤΟΛΗ: ΑΠΛΗ ΜΕΤΑΒΑΣΗ ΣΕ X, Y ΣΥΝΤΕΤΑΓΜΕΝΕΣ ---
+    std::stringstream ss(line); 
+    double tx, ty;
+    if (ss >> tx >> ty) {
+        std::cout << "\n>>> ΕΚΤΕΛΕΣΗ ΜΕΤΑΒΑΣΗΣ: Στόχος X=" << tx << "m, Y=" << ty << "m" << std::endl;
+        if (!try_direct_cartesian(tx, ty)) {
+            std::cout << "    [-] Αποτυχία εύρεσης διαδρομής για X=" << tx << ", Y=" << ty << " σε όλα τα πιθανά ύψη." << std::endl;
+        }
+        continue;
+    } else {
+        std::cout << "[-] Άγνωστη ή λανθασμένη εντολή. Δοκιμάστε ξανά." << std::endl;
+    }
   }
   rclcpp::shutdown();
   return 0;
