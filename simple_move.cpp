@@ -113,27 +113,48 @@ int main(int argc, char * argv[])
       return false;
   };
 
-  // --- 2. Vertical Move ---
+// --- 2. Vertical Move (with 0.5cm tolerance) ---
   auto strict_vertical_move = [&](double delta_z) -> bool {
       std::cout << "    [Vertical Move] Moving vertically " << delta_z * 100 << " cm..." << std::endl;
       
-      geometry_msgs::msg::Pose target_pose = arm_interface.getCurrentPose().pose;
-      target_pose.position.z += delta_z; 
-
-      std::vector<geometry_msgs::msg::Pose> waypoints = {target_pose};
+      geometry_msgs::msg::Pose current_pose = arm_interface.getCurrentPose().pose;
+      std::vector<double> offsets = {0.0, 0.0025, -0.0025, 0.005, -0.005};
       moveit_msgs::msg::RobotTrajectory traj;
-      
-      double fraction = arm_interface.computeCartesianPath(waypoints, 0.005, 1.5, traj);
 
-      if (fraction >= 0.99) { 
-          moveit::planning_interface::MoveGroupInterface::Plan plan;
-          plan.trajectory_ = traj;
-          arm_interface.execute(plan); 
-          return true;
-      } else {
-          std::cout << "    [-] Failed to move vertically." << std::endl;
-          return false;
+      for (double dx : offsets) {
+          for (double dy : offsets) {
+              for (double dz_offset : offsets) {
+                  // Strict check: Ensure the 3D distance of the offset is maximum 0.5 cm
+                  double distance = std::sqrt(dx*dx + dy*dy + dz_offset*dz_offset);
+                  if (distance > 0.0051) continue;
+
+                  geometry_msgs::msg::Pose target_pose = current_pose;
+                  target_pose.position.x += dx;
+                  target_pose.position.y += dy;
+                  target_pose.position.z += (delta_z + dz_offset); 
+
+                  std::vector<geometry_msgs::msg::Pose> waypoints = {target_pose};
+                  
+                  // Keep your 0.005 step size and the 1.5 jump_threshold
+                  double fraction = arm_interface.computeCartesianPath(waypoints, 0.005, 1.5, traj);
+
+                  if (fraction >= 0.99) { 
+                      moveit::planning_interface::MoveGroupInterface::Plan plan;
+                      plan.trajectory_ = traj;
+                      arm_interface.execute(plan); 
+                      
+                      if (distance > 0.0) {
+                          std::cout << "    [+] Βρέθηκε κάθετη διαδρομή με μικρή απόκλιση: dx=" 
+                                    << dx << "m, dy=" << dy << "m, dz_offset=" << dz_offset << "m" << std::endl;
+                      }
+                      return true;
+                  }
+              }
+          }
       }
+
+      std::cout << "    [-] Failed to move vertically, even with offsets." << std::endl;
+      return false;
   };
 
   // --- 3. Rotating the last joint ---
