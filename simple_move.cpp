@@ -71,80 +71,125 @@ int main(int argc, char * argv[])
   collision_object.operation = collision_object.ADD;
   planning_scene_interface.applyCollisionObjects({collision_object});
 
-  // --- 1. CARTESIAN PATH WITH Z-SWEEP, XY-TOLERANCE, AND ROLL-SWEEP ---
+  // --- 1. COARSE-TO-FINE CARTESIAN SEARCH (The fast & reliable method) ---
   auto try_direct_cartesian = [&](double target_x, double target_y) -> bool {
     geometry_msgs::msg::Pose current_pose = arm_interface.getCurrentPose().pose;
     double current_z = current_pose.position.z;
+    moveit_msgs::msg::RobotTrajectory traj;
 
-    // 1. Generate heights from 20cm to 30cm in 2cm steps, sorted by current height
-    std::vector<double> z_heights;
-    for (double z = 0.20; z <= 0.3001; z += 0.02) {
-        z_heights.push_back(z);
-    }
-    std::sort(z_heights.begin(), z_heights.end(), [current_z](double a, double b) {
+    // --- COARSE PASS SETUP ---
+    std::vector<double> coarse_z = {0.20, 0.24, 0.28, 0.30};
+    std::sort(coarse_z.begin(), coarse_z.end(), [current_z](double a, double b) {
         return std::abs(a - current_z) < std::abs(b - current_z);
     });
 
-    // 2. Fast "Cross" pattern XY offsets: Center, +X, -X, +Y, -Y at 5mm
+    // Fast Roll offsets: 0, 45, -45, 90, -90 degrees
+    std::vector<double> coarse_roll = {0.0, 0.785, -0.785, 1.57, -1.57}; 
+
     struct Offset { double dx; double dy; };
     std::vector<Offset> xy_offsets = {
         {0.0, 0.0}, {0.005, 0.0}, {-0.005, 0.0}, {0.0, 0.005}, {0.0, -0.005}
     };
 
-    // 3. Roll Offsets (Wrist spin): 0°, +30°, -30°, +60°, -60° in radians
-    std::vector<double> roll_offsets = {0.0, 0.523, -0.523, 1.047, -1.047};
+    double best_fraction = 0.0;
+    double best_z = current_z;
+    double best_roll = 0.0;
     
-    moveit_msgs::msg::RobotTrajectory traj;
+    std::cout << "    [*] Ξεκινάει Γρήγορη Σάρωση (Coarse Search)..." << std::endl;
 
-    for (double test_z : z_heights) {
-        for (const auto& offset : xy_offsets) {
-            for (double roll_off : roll_offsets) {
+    for (double test_z : coarse_z) {
+        for (double test_roll : coarse_roll) {
+            for (const auto& offset : xy_offsets) {
                 geometry_msgs::msg::Pose target;
                 target.position.x = target_x + offset.dx;
                 target.position.y = target_y + offset.dy;
                 target.position.z = test_z; 
 
-                // --- Calculate the new wrist angle mathematically ---
-                tf2::Quaternion q_current(
-                    current_pose.orientation.x, current_pose.orientation.y, 
-                    current_pose.orientation.z, current_pose.orientation.w
-                );
-                
+                // Apply mathematically safe wrist roll
+                tf2::Quaternion q_current(current_pose.orientation.x, current_pose.orientation.y, 
+                                          current_pose.orientation.z, current_pose.orientation.w);
                 tf2::Quaternion q_rot;
-                q_rot.setRPY(roll_off, 0, 0); // Apply Roll twist
-                
-                tf2::Quaternion q_target = q_current * q_rot; // Combine them
+                q_rot.setRPY(test_roll, 0, 0); 
+                tf2::Quaternion q_target = q_current * q_rot;
                 q_target.normalize();
 
-                target.orientation.x = q_target.x();
-                target.orientation.y = q_target.y();
-                target.orientation.z = q_target.z();
-                target.orientation.w = q_target.w();
+                target.orientation.x = q_target.x(); target.orientation.y = q_target.y();
+                target.orientation.z = q_target.z(); target.orientation.w = q_target.w();
 
                 std::vector<geometry_msgs::msg::Pose> waypoints = {target};
                 
-                // Use computeCartesianPath! Perfectly straight lines, no OMPL chaos.
-                double fraction = arm_interface.computeCartesianPath(waypoints, 0.02, 1.5, traj);
+                // Huge eef_step (4cm) for ultra-fast calculation in the coarse pass
+                double fraction = arm_interface.computeCartesianPath(waypoints, 0.04, 1.5, traj);
 
-                if (fraction >= 0.95) {
+                if (fraction >= 0.95) { 
                     moveit::planning_interface::MoveGroupInterface::Plan plan;
                     plan.trajectory_ = traj;
-                    
                     if (arm_interface.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-                        double distance_xy = std::sqrt(offset.dx*offset.dx + offset.dy*offset.dy);
-                        std::cout << "    [+] Επιτυχία! Ύψος: " << test_z * 100 
-                                  << " cm | Απόκλιση XY: " << distance_xy * 1000 
-                                  << " mm | Καρπός (Roll): " << roll_off * 180.0 / M_PI << "°" << std::endl;
+                        std::cout << "    [+] Βρέθηκε άμεσα! Z=" << test_z*100 
+                                  << "cm, Roll=" << test_roll*180/M_PI << "°" << std::endl;
                         return true;
-                    } else {
-                        std::cout << "    [-] Η διαδρομή βρέθηκε αλλά απέτυχε η εκτέλεση. Δοκιμή επόμενης..." << std::endl;
+                    }
+                }
+                
+                // Keep track of what "almost" worked
+                if (fraction > best_fraction) {
+                    best_fraction = fraction;
+                    best_z = test_z;
+                    best_roll = test_roll;
+                }
+            }
+        }
+    }
+
+    // --- FINE PASS SETUP ---
+    // If the coarse pass found a promising direction (fraction > 30%)
+    if (best_fraction > 0.3) { 
+        std::cout << "    [*] Η γρήγορη σάρωση έφτασε στο " << best_fraction*100 
+                  << "%. Βαθύτερος έλεγχος γύρω από Z=" << best_z*100 
+                  << "cm και Roll=" << best_roll*180/M_PI << "°..." << std::endl;
+        
+        // Micro-grid around the best results (1cm height steps, ~5 degree roll steps)
+        for (double fine_z = best_z - 0.02; fine_z <= best_z + 0.021; fine_z += 0.01) {
+            if (fine_z < 0.20 || fine_z > 0.30) continue; // Keep within safe limits
+
+            for (double fine_roll = best_roll - 0.174; fine_roll <= best_roll + 0.175; fine_roll += 0.087) {
+                for (const auto& offset : xy_offsets) {
+                    geometry_msgs::msg::Pose target;
+                    target.position.x = target_x + offset.dx;
+                    target.position.y = target_y + offset.dy;
+                    target.position.z = fine_z; 
+
+                    tf2::Quaternion q_current(current_pose.orientation.x, current_pose.orientation.y, 
+                                              current_pose.orientation.z, current_pose.orientation.w);
+                    tf2::Quaternion q_rot;
+                    q_rot.setRPY(fine_roll, 0, 0); 
+                    tf2::Quaternion q_target = q_current * q_rot;
+                    q_target.normalize();
+
+                    target.orientation.x = q_target.x(); target.orientation.y = q_target.y();
+                    target.orientation.z = q_target.z(); target.orientation.w = q_target.w();
+
+                    std::vector<geometry_msgs::msg::Pose> waypoints = {target};
+                    
+                    // Normal eef_step (1cm) for strict, high-precision Cartesian lines
+                    double fraction = arm_interface.computeCartesianPath(waypoints, 0.01, 1.5, traj);
+
+                    if (fraction >= 0.95) {
+                        moveit::planning_interface::MoveGroupInterface::Plan plan;
+                        plan.trajectory_ = traj;
+                        if (arm_interface.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                            std::cout << "    [+] Επιτυχία (Fine Search)! Z=" << fine_z*100 
+                                      << "cm, Roll=" << fine_roll*180/M_PI << "°" << std::endl;
+                            return true;
+                        }
                     }
                 }
             }
         }
     }
     
-    return false; 
+    std::cout << "    [-] Αποτυχία εύρεσης ασφαλούς διαδρομής." << std::endl;
+    return false;
   };
 
   // --- 2. Strict Vertical Move for Pick/Drop ---
@@ -275,7 +320,6 @@ int main(int argc, char * argv[])
                 std::cout << "\n>>> Εντοπίστηκε το Marker " << marker_id 
                           << ". Στόχος: X=" << target_x << ", Y=" << target_y << std::endl;
 
-                // Call the updated Cartesian function
                 if (!try_direct_cartesian(target_x, target_y)) {
                     std::cout << "    [-] Αποτυχία απευθείας μετάβασης. Δοκιμή μέσω κεντρικών Markers (Bridge)..." << std::endl;
                     
