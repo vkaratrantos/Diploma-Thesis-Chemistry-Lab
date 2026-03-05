@@ -8,6 +8,7 @@
 #include <cmath>
 #include <chrono>
 #include <algorithm> 
+#include <functional> // ΥΠΟΧΡΕΩΤΙΚΟ ΓΙΑ THN ΑΝΑΔΡΟΜΗ (Recursion)
 
 #include <rclcpp/rclcpp.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
@@ -71,20 +72,19 @@ int main(int argc, char * argv[])
   collision_object.operation = collision_object.ADD;
   planning_scene_interface.applyCollisionObjects({collision_object});
 
-  // --- 1. COARSE-TO-FINE CARTESIAN SEARCH (The fast & reliable method) ---
-  auto try_direct_cartesian = [&](double target_x, double target_y) -> bool {
+  // --- 1. COARSE-TO-FINE CARTESIAN SEARCH WITH UNIVERSAL BRIDGE (Recursion) ---
+  std::function<bool(double, double, bool)> try_direct_cartesian;
+  try_direct_cartesian = [&](double target_x, double target_y, bool allow_bridge) -> bool {
     geometry_msgs::msg::Pose current_pose = arm_interface.getCurrentPose().pose;
     double current_z = current_pose.position.z;
     moveit_msgs::msg::RobotTrajectory traj;
 
-    // --- COARSE PASS SETUP ---
     std::vector<double> coarse_z = {0.20, 0.24, 0.28, 0.30};
     std::sort(coarse_z.begin(), coarse_z.end(), [current_z](double a, double b) {
         return std::abs(a - current_z) < std::abs(b - current_z);
     });
 
-    // Fast Roll offsets: 0, 45, -45, 90, -90 degrees
-    std::vector<double> coarse_roll = {0.0, 0.785, -0.785, 1.57, -1.57}; 
+    std::vector<double> coarse_roll = {0.0, 0.261, -0.261, 0.523, -0.523}; 
 
     struct Offset { double dx; double dy; };
     std::vector<Offset> xy_offsets = {
@@ -105,7 +105,6 @@ int main(int argc, char * argv[])
                 target.position.y = target_y + offset.dy;
                 target.position.z = test_z; 
 
-                // Apply mathematically safe wrist roll
                 tf2::Quaternion q_current(current_pose.orientation.x, current_pose.orientation.y, 
                                           current_pose.orientation.z, current_pose.orientation.w);
                 tf2::Quaternion q_rot;
@@ -118,7 +117,6 @@ int main(int argc, char * argv[])
 
                 std::vector<geometry_msgs::msg::Pose> waypoints = {target};
                 
-                // Huge eef_step (4cm) for ultra-fast calculation in the coarse pass
                 double fraction = arm_interface.computeCartesianPath(waypoints, 0.04, 1.5, traj);
 
                 if (fraction >= 0.95) { 
@@ -131,7 +129,6 @@ int main(int argc, char * argv[])
                     }
                 }
                 
-                // Keep track of what "almost" worked
                 if (fraction > best_fraction) {
                     best_fraction = fraction;
                     best_z = test_z;
@@ -141,18 +138,17 @@ int main(int argc, char * argv[])
         }
     }
 
-    // --- FINE PASS SETUP ---
-    // If the coarse pass found a promising direction (fraction > 30%)
     if (best_fraction > 0.3) { 
         std::cout << "    [*] Η γρήγορη σάρωση έφτασε στο " << best_fraction*100 
                   << "%. Βαθύτερος έλεγχος γύρω από Z=" << best_z*100 
                   << "cm και Roll=" << best_roll*180/M_PI << "°..." << std::endl;
         
-        // Micro-grid around the best results (1cm height steps, ~5 degree roll steps)
         for (double fine_z = best_z - 0.02; fine_z <= best_z + 0.021; fine_z += 0.01) {
-            if (fine_z < 0.20 || fine_z > 0.30) continue; // Keep within safe limits
+            if (fine_z < 0.20 || fine_z > 0.30) continue; 
 
             for (double fine_roll = best_roll - 0.174; fine_roll <= best_roll + 0.175; fine_roll += 0.087) {
+                if (fine_roll < -0.524 || fine_roll > 0.524) continue;
+
                 for (const auto& offset : xy_offsets) {
                     geometry_msgs::msg::Pose target;
                     target.position.x = target_x + offset.dx;
@@ -171,7 +167,6 @@ int main(int argc, char * argv[])
 
                     std::vector<geometry_msgs::msg::Pose> waypoints = {target};
                     
-                    // Normal eef_step (1cm) for strict, high-precision Cartesian lines
                     double fraction = arm_interface.computeCartesianPath(waypoints, 0.01, 1.5, traj);
 
                     if (fraction >= 0.95) {
@@ -188,7 +183,29 @@ int main(int argc, char * argv[])
         }
     }
     
-    std::cout << "    [-] Αποτυχία εύρεσης ασφαλούς διαδρομής." << std::endl;
+    // =========================================================================
+    // THE UNIVERSAL BRIDGE FALLBACK (Recursion logic)
+    // =========================================================================
+    if (allow_bridge) {
+        std::cout << "    [-] Αποτυχία απευθείας μετάβασης. Δοκιμή μέσω Κεντρικής Γέφυρας (X=0.0, Y=-0.2)..." << std::endl;
+        
+        // 1. Προσωρινή μετάβαση στη γέφυρα (pass 'false' to prevent infinite loops)
+        if (try_direct_cartesian(0.0, -0.2, false)) {
+            std::cout << "    [UNIVERSAL BRIDGE] Το ρομπότ έφτασε στη γέφυρα. Προσπάθεια για τον τελικό στόχο..." << std::endl;
+            
+            // 2. Από τη γέφυρα, πάμε στον τελικό στόχο!
+            if (try_direct_cartesian(target_x, target_y, false)) {
+                std::cout << "    [UNIVERSAL BRIDGE] Επιτυχία! Ο τελικός στόχος προσεγγίστηκε μέσω της γέφυρας." << std::endl;
+                return true;
+            } else {
+                std::cout << "    [UNIVERSAL BRIDGE] ΣΦΑΛΜΑ: Το ρομπότ έφτασε στη γέφυρα αλλά αδυνατεί να βρει τον στόχο." << std::endl;
+                return false;
+            }
+        } else {
+            std::cout << "    [UNIVERSAL BRIDGE] ΣΦΑΛΜΑ: Το ρομπότ απέτυχε να φτάσει ακόμα και στη Γέφυρα!" << std::endl;
+        }
+    }
+
     return false;
   };
 
@@ -320,8 +337,9 @@ int main(int argc, char * argv[])
                 std::cout << "\n>>> Εντοπίστηκε το Marker " << marker_id 
                           << ". Στόχος: X=" << target_x << ", Y=" << target_y << std::endl;
 
-                if (!try_direct_cartesian(target_x, target_y)) {
-                    std::cout << "    [-] Αποτυχία απευθείας μετάβασης. Δοκιμή μέσω κεντρικών Markers (Bridge)..." << std::endl;
+                // Περνάμε true για να επιτρέψουμε τη χρήση της γενικής γέφυρας αν χρειαστεί
+                if (!try_direct_cartesian(target_x, target_y, true)) {
+                    std::cout << "    [-] Αποτυχία απευθείας μετάβασης. Δοκιμή μέσω ενδιάμεσων Markers (Bridge)..." << std::endl;
                     
                     std::vector<int> fallback_markers = {3, 0, 2}; 
                     bool success_via_bridge = false;
@@ -338,16 +356,17 @@ int main(int argc, char * argv[])
                             double bridge_x = t_bridge.transform.translation.x;
                             double bridge_y = t_bridge.transform.translation.y;
 
-                            std::cout << "    [BRIDGE] Δοκιμή μετάβασης στο ενδιάμεσο Marker " << bridge_id << "..." << std::endl;
+                            std::cout << "    [MARKER BRIDGE] Δοκιμή μετάβασης στο Marker " << bridge_id << "..." << std::endl;
                             
-                            if (try_direct_cartesian(bridge_x, bridge_y)) {
-                                std::cout << "    [BRIDGE] Επιτυχία! Τώρα προσπάθεια για τον τελικό στόχο (Marker " << marker_id << ")..." << std::endl;
+                            // Εδώ βάζουμε false για να μην κάνει διπλή αναδρομή
+                            if (try_direct_cartesian(bridge_x, bridge_y, false)) {
+                                std::cout << "    [MARKER BRIDGE] Επιτυχία! Τώρα προσπάθεια για τον τελικό στόχο (Marker " << marker_id << ")..." << std::endl;
                                 
-                                if (try_direct_cartesian(target_x, target_y)) {
+                                if (try_direct_cartesian(target_x, target_y, false)) {
                                     success_via_bridge = true;
                                     break; 
                                 } else {
-                                    std::cout << "    [BRIDGE] Αποτυχία από τη γέφυρα προς τον στόχο. Θα δοκιμαστεί άλλη εναλλακτική." << std::endl;
+                                    std::cout << "    [MARKER BRIDGE] Αποτυχία από τη γέφυρα προς τον στόχο. Θα δοκιμαστεί άλλη εναλλακτική." << std::endl;
                                 }
                             }
                         } catch (const tf2::TransformException & ex) {
@@ -446,7 +465,9 @@ int main(int argc, char * argv[])
     double tx, ty;
     if (ss >> tx >> ty) {
         std::cout << "\n>>> ΕΚΤΕΛΕΣΗ ΜΕΤΑΒΑΣΗΣ: Στόχος X=" << tx << "m, Y=" << ty << "m" << std::endl;
-        if (!try_direct_cartesian(tx, ty)) {
+        
+        // Περνάμε true για να επιτρέψουμε τη χρήση της γενικής γέφυρας
+        if (!try_direct_cartesian(tx, ty, true)) {
             std::cout << "    [-] Αποτυχία εύρεσης διαδρομής για X=" << tx << ", Y=" << ty << " σε όλα τα πιθανά ύψη." << std::endl;
         }
         continue;
