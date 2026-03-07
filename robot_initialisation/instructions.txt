@@ -48,7 +48,7 @@ Wait until you see the message that confirms the connection
 4. PC (Terminal 3 - Driver 2)
 
 $ cd ~/my_robot
-$ python3 moveit_bridge_2.py
+$ python3 moveit_bridge_5.py
 
 5. PC (Terminal 4 - The Controller)
 
@@ -58,4 +58,4 @@ We will choose to control it through moveit and we will visualise the robot.
 
 Example :
 
-$ ros2 launch myarm_300_pi_moveit_config demo.launch.py
+$ ros2 launch robot_config real.launch.py
