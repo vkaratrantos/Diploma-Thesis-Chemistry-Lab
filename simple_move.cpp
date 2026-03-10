@@ -346,8 +346,16 @@ int main(int argc, char * argv[])
                 double target_x = t.transform.translation.x; 
                 double target_y = t.transform.translation.y; 
 
+                // ==========================================
+                // NEW: ADD 6cm Y-OFFSET FOR MARKERS 1 TO 5
+                // ==========================================
+                if (marker_id >= 1 && marker_id <= 5) {
+                    target_y += 0.06;
+                    std::cout << "    [!] Εφαρμόστηκε offset +6cm στον άξονα Y για το Marker " << marker_id << std::endl;
+                }
+
                 std::cout << "\n>>> Εντοπίστηκε το Marker " << marker_id 
-                          << ". Στόχος: X=" << target_x << ", Y=" << target_y << std::endl;
+                          << ". Τελικός Στόχος: X=" << target_x << ", Y=" << target_y << std::endl;
 
                 if (!try_direct_cartesian(target_x, target_y, true)) {
                     std::cout << "    [-] Αποτυχία απευθείας μετάβασης. Δοκιμή μέσω ενδιάμεσων Markers (Bridge)..." << std::endl;
@@ -383,6 +391,70 @@ int main(int argc, char * argv[])
                             continue; 
                         }
                     }
+#include <memory>
+#include <thread>
+#include <iostream>
+#include <string>
+#include <sstream>
+#include <vector>
+#include <iomanip>
+#include <cmath>
+#include <chrono>
+#include <algorithm> 
+#include <functional> 
+
+#include <rclcpp/rclcpp.hpp>
+#include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit_msgs/msg/collision_object.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+#include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h> 
+
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+
+void printPose(const geometry_msgs::msg::Pose& pose) {
+    double r, p, y;
+    tf2::Quaternion q(pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w);
+    tf2::Matrix3x3(q).getRPY(r, p, y);
+    
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "[ΤΡΕΧΟΥΣΑ ΘΕΣΗ]: X=" << pose.position.x 
+              << ", Y=" << pose.position.y 
+              << ", Z=" << pose.position.z 
+              << " | RPY (deg): " << (r * 180.0 / M_PI) << ", " 
+              << (p * 180.0 / M_PI) << ", " 
+              << (y * 180.0 / M_PI) << std::endl;
+}
+
+int main(int argc, char * argv[])
+{
+  rclcpp::init(argc, argv);
+  auto const node = std::make_shared<rclcpp::Node>("cartesian_cube_search_node");
+
+  auto executor = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
+  executor->add_node(node);
+  std::thread([executor]() { executor->spin(); }).detach();
+
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer = std::make_unique<tf2_ros::Buffer>(node->get_clock());
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
+
+  using moveit::planning_interface::MoveGroupInterface;
+  MoveGroupInterface arm_interface(node, "arm_group"); 
+  MoveGroupInterface gripper_interface(node, "gripper"); 
+  
+  arm_interface.setPlanningTime(1.0);
+  arm_interface.setMaxVelocityScalingFactor(0.3); 
+  arm_interface.setMaxAccelerationScalingFactor(0.3);
+
+  // --- Adding the floor as collision ---
+  moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
+  moveit_msgs::msg::CollisionObject collision_object;
+  collision_object.header.frame_id = arm_interface.getPlanningFrame();
+  collision_object.id = "floor";
 
                     if (!success_via_bridge) {
                         std::cout << "    [-] Τελική Αποτυχία. Δεν βρέθηκε διαδρομή ούτε μέσω ενδιάμεσων Markers." << std::endl;
