@@ -8,7 +8,7 @@
 #include <cmath>
 #include <chrono>
 #include <algorithm> 
-#include <functional> // ΥΠΟΧΡΕΩΤΙΚΟ ΓΙΑ THN ΑΝΑΔΡΟΜΗ (Recursion)
+#include <functional> 
 
 #include <rclcpp/rclcpp.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
@@ -72,7 +72,21 @@ int main(int argc, char * argv[])
   collision_object.operation = collision_object.ADD;
   planning_scene_interface.applyCollisionObjects({collision_object});
 
-  // --- 1. COARSE-TO-FINE CARTESIAN SEARCH WITH UNIVERSAL BRIDGE (Recursion) ---
+  // =========================================================================
+  // FIX: Define Home Pose FIRST so all lambdas can reference its pure orientation
+  // =========================================================================
+  geometry_msgs::msg::Pose home_pose;
+  home_pose.position.x = -0.15;
+  home_pose.position.y = -0.2;
+  home_pose.position.z = 0.25; 
+  tf2::Quaternion q_home;
+  q_home.setRPY(M_PI, -M_PI/2.0, -M_PI/2.0);
+  home_pose.orientation.x = q_home.x();
+  home_pose.orientation.y = q_home.y();
+  home_pose.orientation.z = q_home.z();
+  home_pose.orientation.w = q_home.w();
+
+  // --- 1. COARSE-TO-FINE CARTESIAN SEARCH (Horizontal Transit) ---
   std::function<bool(double, double, bool)> try_direct_cartesian;
   try_direct_cartesian = [&](double target_x, double target_y, bool allow_bridge) -> bool {
     geometry_msgs::msg::Pose current_pose = arm_interface.getCurrentPose().pose;
@@ -105,11 +119,12 @@ int main(int argc, char * argv[])
                 target.position.y = target_y + offset.dy;
                 target.position.z = test_z; 
 
-                tf2::Quaternion q_current(current_pose.orientation.x, current_pose.orientation.y, 
-                                          current_pose.orientation.z, current_pose.orientation.w);
+                // FIX: Use q_home as the baseline so roll doesn't accumulate!
+                tf2::Quaternion q_base(home_pose.orientation.x, home_pose.orientation.y, 
+                                       home_pose.orientation.z, home_pose.orientation.w);
                 tf2::Quaternion q_rot;
                 q_rot.setRPY(test_roll, 0, 0); 
-                tf2::Quaternion q_target = q_current * q_rot;
+                tf2::Quaternion q_target = q_base * q_rot;
                 q_target.normalize();
 
                 target.orientation.x = q_target.x(); target.orientation.y = q_target.y();
@@ -155,11 +170,11 @@ int main(int argc, char * argv[])
                     target.position.y = target_y + offset.dy;
                     target.position.z = fine_z; 
 
-                    tf2::Quaternion q_current(current_pose.orientation.x, current_pose.orientation.y, 
-                                              current_pose.orientation.z, current_pose.orientation.w);
+                    tf2::Quaternion q_base(home_pose.orientation.x, home_pose.orientation.y, 
+                                           home_pose.orientation.z, home_pose.orientation.w);
                     tf2::Quaternion q_rot;
                     q_rot.setRPY(fine_roll, 0, 0); 
-                    tf2::Quaternion q_target = q_current * q_rot;
+                    tf2::Quaternion q_target = q_base * q_rot;
                     q_target.normalize();
 
                     target.orientation.x = q_target.x(); target.orientation.y = q_target.y();
@@ -183,71 +198,81 @@ int main(int argc, char * argv[])
         }
     }
     
-    // =========================================================================
-    // THE UNIVERSAL BRIDGE FALLBACK (Recursion logic)
-    // =========================================================================
+    // --- UNIVERSAL BRIDGE FALLBACK ---
     if (allow_bridge) {
         std::cout << "    [-] Αποτυχία απευθείας μετάβασης. Δοκιμή μέσω Κεντρικής Γέφυρας (X=0.0, Y=-0.2)..." << std::endl;
-        
-        // 1. Προσωρινή μετάβαση στη γέφυρα (pass 'false' to prevent infinite loops)
         if (try_direct_cartesian(0.0, -0.2, false)) {
             std::cout << "    [UNIVERSAL BRIDGE] Το ρομπότ έφτασε στη γέφυρα. Προσπάθεια για τον τελικό στόχο..." << std::endl;
-            
-            // 2. Από τη γέφυρα, πάμε στον τελικό στόχο!
             if (try_direct_cartesian(target_x, target_y, false)) {
-                std::cout << "    [UNIVERSAL BRIDGE] Επιτυχία! Ο τελικός στόχος προσεγγίστηκε μέσω της γέφυρας." << std::endl;
+                std::cout << "    [UNIVERSAL BRIDGE] Επιτυχία! Ο τελικός στόχος προσεγγίστηκε." << std::endl;
                 return true;
-            } else {
-                std::cout << "    [UNIVERSAL BRIDGE] ΣΦΑΛΜΑ: Το ρομπότ έφτασε στη γέφυρα αλλά αδυνατεί να βρει τον στόχο." << std::endl;
-                return false;
             }
-        } else {
-            std::cout << "    [UNIVERSAL BRIDGE] ΣΦΑΛΜΑ: Το ρομπότ απέτυχε να φτάσει ακόμα και στη Γέφυρα!" << std::endl;
         }
+        std::cout << "    [UNIVERSAL BRIDGE] ΣΦΑΛΜΑ: Αποτυχία εύρεσης διαδρομής." << std::endl;
     }
 
     return false;
   };
 
-  // --- 2. Strict Vertical Move for Pick/Drop ---
-  auto strict_vertical_move = [&](double delta_z) -> bool {
-      std::cout << "    [Vertical Move] Moving vertically " << delta_z * 100 << " cm..." << std::endl;
-      
+  // --- 2. NEW: SMART VERTICAL DESCENT / ASCENT (For Pick & Drop) ---
+  auto smart_vertical_move = [&](double z_min, double z_max, bool is_descent) -> bool {
       geometry_msgs::msg::Pose current_pose = arm_interface.getCurrentPose().pose;
-      std::vector<double> offsets = {0.0, 0.0025, -0.0025, 0.005, -0.005};
+      double current_x = current_pose.position.x;
+      double current_y = current_pose.position.y;
+      
+      std::vector<double> z_heights;
+      if (is_descent) {
+          // If descending, start high (e.g. 11cm) and step down to safe limit (7cm)
+          for (double z = z_max; z >= z_min - 0.001; z -= 0.01) z_heights.push_back(z);
+      } else {
+          // If ascending, start low (e.g. 25cm) and step up to max clearance (30cm)
+          for (double z = z_min; z <= z_max + 0.001; z += 0.01) z_heights.push_back(z);
+      }
+
+      std::vector<double> coarse_roll = {0.0, 0.261, -0.261, 0.523, -0.523}; 
+      struct Offset { double dx; double dy; };
+      std::vector<Offset> xy_offsets = { {0.0, 0.0}, {0.005, 0.0}, {-0.005, 0.0}, {0.0, 0.005}, {0.0, -0.005} };
+      
       moveit_msgs::msg::RobotTrajectory traj;
 
-      for (double dx : offsets) {
-          for (double dy : offsets) {
-              for (double dz_offset : offsets) {
-                  double distance = std::sqrt(dx*dx + dy*dy + dz_offset*dz_offset);
-                  if (distance > 0.0051) continue;
-
-                  geometry_msgs::msg::Pose target_pose = current_pose;
-                  target_pose.position.x += dx;
-                  target_pose.position.y += dy;
-                  target_pose.position.z += (delta_z + dz_offset); 
-
-                  std::vector<geometry_msgs::msg::Pose> waypoints = {target_pose};
+      for (double test_z : z_heights) {
+          for (double test_roll : coarse_roll) {
+              for (const auto& offset : xy_offsets) {
+                  geometry_msgs::msg::Pose target;
+                  target.position.x = current_x + offset.dx;
+                  target.position.y = current_y + offset.dy;
+                  target.position.z = test_z;
                   
-                  double fraction = arm_interface.computeCartesianPath(waypoints, 0.005, 1.5, traj);
+                  tf2::Quaternion q_base(home_pose.orientation.x, home_pose.orientation.y, 
+                                         home_pose.orientation.z, home_pose.orientation.w);
+                  tf2::Quaternion q_rot;
+                  q_rot.setRPY(test_roll, 0, 0); 
+                  tf2::Quaternion q_target = q_base * q_rot;
+                  q_target.normalize();
 
-                  if (fraction >= 0.99) { 
+                  target.orientation.x = q_target.x(); target.orientation.y = q_target.y();
+                  target.orientation.z = q_target.z(); target.orientation.w = q_target.w();
+
+                  std::vector<geometry_msgs::msg::Pose> waypoints = {target};
+                  
+                  double fraction = arm_interface.computeCartesianPath(waypoints, 0.01, 1.5, traj);
+
+                  if (fraction >= 0.95) {
                       moveit::planning_interface::MoveGroupInterface::Plan plan;
                       plan.trajectory_ = traj;
-                      arm_interface.execute(plan); 
-                      
-                      if (distance > 0.0) {
-                          std::cout << "    [+] Βρέθηκε κάθετη διαδρομή με μικρή απόκλιση: dx=" 
-                                    << dx << "m, dy=" << dy << "m, dz_offset=" << dz_offset << "m" << std::endl;
+                      if (arm_interface.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                          std::cout << "    [+] Επιτυχία Κάθετης Κίνησης! Z=" << test_z*100 
+                                    << "cm, Απόκλιση XY: " << std::sqrt(offset.dx*offset.dx + offset.dy*offset.dy)*1000 
+                                    << "mm, Roll=" << test_roll*180/M_PI << "°" << std::endl;
+                          return true;
                       }
-                      return true;
                   }
               }
           }
       }
-
-      std::cout << "    [-] Failed to move vertically, even with offsets." << std::endl;
+      
+      std::cout << "    [-] Αποτυχία εύρεσης κάθετης διαδρομής. Ζητήθηκε Z μεταξύ " 
+                << z_min*100 << "cm και " << z_max*100 << "cm." << std::endl;
       return false;
   };
 
@@ -284,19 +309,6 @@ int main(int argc, char * argv[])
 
   std::cout << ">>> Heading to Home Position (-0.15, -0.2, 0.25) with vertical orientation..." << std::endl;
   arm_interface.clearPoseTargets();
-  
-  geometry_msgs::msg::Pose home_pose;
-  home_pose.position.x = -0.15;
-  home_pose.position.y = -0.2;
-  home_pose.position.z = 0.25; 
-
-  tf2::Quaternion q_home;
-  q_home.setRPY(M_PI, -M_PI/2.0, -M_PI/2.0);
-  home_pose.orientation.x = q_home.x();
-  home_pose.orientation.y = q_home.y();
-  home_pose.orientation.z = q_home.z();
-  home_pose.orientation.w = q_home.w();
-
   arm_interface.setPoseTarget(home_pose);
   if (arm_interface.move() != moveit::core::MoveItErrorCode::SUCCESS) {
       RCLCPP_ERROR(node->get_logger(), "Failed to go to Home Position!");
@@ -337,7 +349,6 @@ int main(int argc, char * argv[])
                 std::cout << "\n>>> Εντοπίστηκε το Marker " << marker_id 
                           << ". Στόχος: X=" << target_x << ", Y=" << target_y << std::endl;
 
-                // Περνάμε true για να επιτρέψουμε τη χρήση της γενικής γέφυρας αν χρειαστεί
                 if (!try_direct_cartesian(target_x, target_y, true)) {
                     std::cout << "    [-] Αποτυχία απευθείας μετάβασης. Δοκιμή μέσω ενδιάμεσων Markers (Bridge)..." << std::endl;
                     
@@ -358,7 +369,6 @@ int main(int argc, char * argv[])
 
                             std::cout << "    [MARKER BRIDGE] Δοκιμή μετάβασης στο Marker " << bridge_id << "..." << std::endl;
                             
-                            // Εδώ βάζουμε false για να μην κάνει διπλή αναδρομή
                             if (try_direct_cartesian(bridge_x, bridge_y, false)) {
                                 std::cout << "    [MARKER BRIDGE] Επιτυχία! Τώρα προσπάθεια για τον τελικό στόχο (Marker " << marker_id << ")..." << std::endl;
                                 
@@ -404,7 +414,7 @@ int main(int argc, char * argv[])
         continue;
     }
 
-    // --- ΕΝΤΟΛΗ: ΑΥΣΤΗΡΟ PICK ---
+    // --- ΕΝΤΟΛΗ: ΕΞΥΠΝΟ PICK ---
     if (line == "P" || line == "p") {
         std::cout << "\n>>> ΕΚΤΕΛΕΣΗ PICK (ΣΤΗΝ ΤΡΕΧΟΥΣΑ ΘΕΣΗ X, Y)..." << std::endl;
         
@@ -412,8 +422,8 @@ int main(int argc, char * argv[])
         gripper_interface.setNamedTarget("open"); 
         gripper_interface.move(); 
         
-        std::cout << ">>> 2. Αυστηρή Κάθοδος 10 cm..." << std::endl;
-        if(strict_vertical_move(-0.15)) { 
+        std::cout << ">>> 2. Έξυπνη Κάθοδος (11cm έως 7cm)..." << std::endl;
+        if(smart_vertical_move(0.07, 0.11, true)) { 
             
             std::cout << ">>> [Αναμονή 1 δευτερόλεπτο για σταθεροποίηση]..." << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -424,20 +434,20 @@ int main(int argc, char * argv[])
             
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-            std::cout << ">>> 4. Αυστηρή Άνοδος 10 cm..." << std::endl;
-            strict_vertical_move(0.15); 
+            std::cout << ">>> 4. Έξυπνη Άνοδος (Επιστροφή στα 25-30cm)..." << std::endl;
+            smart_vertical_move(0.25, 0.30, false); 
             
             std::cout << ">>> Το Pick ολοκληρώθηκε!" << std::endl;
         }
         continue;
     }
 
-    // --- ΕΝΤΟΛΗ: ΑΥΣΤΗΡΟ DROP / PLACE ---
+    // --- ΕΝΤΟΛΗ: ΕΞΥΠΝΟ DROP / PLACE ---
     if (line == "D" || line == "d") {
         std::cout << "\n>>> ΕΚΤΕΛΕΣΗ DROP/PLACE (ΣΤΗΝ ΤΡΕΧΟΥΣΑ ΘΕΣΗ X, Y)..." << std::endl;
         
-        std::cout << ">>> 1. Αυστηρή Κάθοδος 10 cm..." << std::endl;
-        if(strict_vertical_move(-0.15)) { 
+        std::cout << ">>> 1. Έξυπνη Κάθοδος (11cm έως 7cm)..." << std::endl;
+        if(smart_vertical_move(0.07, 0.11, true)) { 
             
             std::cout << ">>> [Αναμονή 1 δευτερόλεπτο για σταθεροποίηση]..." << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -448,8 +458,8 @@ int main(int argc, char * argv[])
             
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             
-            std::cout << ">>> 3. Αυστηρή Άνοδος 10 cm..." << std::endl;
-            strict_vertical_move(0.15); 
+            std::cout << ">>> 3. Έξυπνη Άνοδος (Επιστροφή στα 25-30cm)..." << std::endl;
+            smart_vertical_move(0.25, 0.30, false); 
 
             std::cout << ">>> 4. Κλείσιμο Gripper..." << std::endl;
             gripper_interface.setNamedTarget("closed"); 
@@ -466,7 +476,6 @@ int main(int argc, char * argv[])
     if (ss >> tx >> ty) {
         std::cout << "\n>>> ΕΚΤΕΛΕΣΗ ΜΕΤΑΒΑΣΗΣ: Στόχος X=" << tx << "m, Y=" << ty << "m" << std::endl;
         
-        // Περνάμε true για να επιτρέψουμε τη χρήση της γενικής γέφυρας
         if (!try_direct_cartesian(tx, ty, true)) {
             std::cout << "    [-] Αποτυχία εύρεσης διαδρομής για X=" << tx << ", Y=" << ty << " σε όλα τα πιθανά ύψη." << std::endl;
         }
