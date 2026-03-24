@@ -310,74 +310,99 @@ int main(int argc, char * argv[])
     if (line == "O" || line == "o") { gripper_interface.setNamedTarget("open"); gripper_interface.move(); continue; } 
     if (line == "C" || line == "c") { gripper_interface.setNamedTarget("closed"); gripper_interface.move(); continue; }
 
-    // --- Command: Going to Marker ---
+    // --- Command: Going to Marker (Double-Pass Execution) ---
     if (line[0] == 'M' || line[0] == 'm') {
         int marker_id;
         std::stringstream ss(line.substr(1));
         if (ss >> marker_id && marker_id >= 0 && marker_id <= 9) {
             
-            std::string target_frame = (marker_id == 0) ? "marker_base" : "marker_" + std::to_string(marker_id);
-            std::string planning_frame = arm_interface.getPlanningFrame();
+            std::cout << "\n>>> Εντολή μετάβασης στο Marker " << marker_id << ". Θα εκτελεστεί 2 φορές για τέλεια ευθυγράμμιση!" << std::endl;
 
-            try {
-                geometry_msgs::msg::TransformStamped t = tf_buffer->lookupTransform(
-                    planning_frame, target_frame, tf2::TimePointZero, std::chrono::seconds(1)
-                );
+            bool success_first_run = false;
 
-                double target_x = t.transform.translation.x; 
-                double target_y = t.transform.translation.y; 
+            for (int run = 1; run <= 2; ++run) {
+                std::cout << "\n--- ΕΚΤΕΛΕΣΗ " << run << " ΑΠΟ 2 ---" << std::endl;
 
-                // Offset 6cm στον Y για Markers 1-5
-                if (marker_id >= 1 && marker_id <= 5) {
-                    target_y += 0.06;
-                    std::cout << "    [!] Εφαρμόστηκε offset +6cm στον άξονα Y για το Marker " << marker_id << std::endl;
+                // Δίνουμε χρόνο στην κάμερα να ανανεώσει το TF
+                if (run == 2) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 }
 
-                std::cout << "\n>>> Εντοπίστηκε το Marker " << marker_id 
-                          << ". Τελικός Στόχος: X=" << target_x << ", Y=" << target_y << std::endl;
+                std::string target_frame = (marker_id == 0) ? "marker_base" : "marker_" + std::to_string(marker_id);
+                std::string planning_frame = arm_interface.getPlanningFrame();
 
-                if (!try_direct_cartesian(target_x, target_y, true)) {
-                    std::cout << "    [-] Αποτυχία απευθείας μετάβασης. Δοκιμή μέσω ενδιάμεσων Markers (Bridge)..." << std::endl;
-                    
-                    std::vector<int> fallback_markers = {3, 0, 2}; 
-                    bool success_via_bridge = false;
+                try {
+                    geometry_msgs::msg::TransformStamped t = tf_buffer->lookupTransform(
+                        planning_frame, target_frame, tf2::TimePointZero, std::chrono::seconds(1)
+                    );
 
-                    for (int bridge_id : fallback_markers) {
-                        if (bridge_id == marker_id) continue; 
+                    double target_x = t.transform.translation.x; 
+                    double target_y = t.transform.translation.y; 
 
-                        std::string bridge_frame = (bridge_id == 0) ? "marker_base" : "marker_" + std::to_string(bridge_id);
-                        try {
-                            geometry_msgs::msg::TransformStamped t_bridge = tf_buffer->lookupTransform(
-                                planning_frame, bridge_frame, tf2::TimePointZero, std::chrono::milliseconds(200)
-                            );
-                            
-                            double bridge_x = t_bridge.transform.translation.x;
-                            double bridge_y = t_bridge.transform.translation.y;
+                    // Offset 6cm στον Y για Markers 1-5
+                    if (marker_id >= 1 && marker_id <= 5) {
+                        target_y += 0.06;
+                        if (run == 1) std::cout << "    [!] Εφαρμόστηκε offset +6cm στον άξονα Y για το Marker " << marker_id << std::endl;
+                    }
 
-                            std::cout << "    [MARKER BRIDGE] Δοκιμή μετάβασης στο Marker " << bridge_id << "..." << std::endl;
-                            
-                            if (try_direct_cartesian(bridge_x, bridge_y, false)) {
-                                std::cout << "    [MARKER BRIDGE] Επιτυχία! Τώρα προσπάθεια για τον τελικό στόχο (Marker " << marker_id << ")..." << std::endl;
+                    std::cout << ">>> Εντοπίστηκε το Marker " << marker_id 
+                              << ". Στόχος: X=" << target_x << ", Y=" << target_y << std::endl;
+
+                    if (!try_direct_cartesian(target_x, target_y, true)) {
+                        std::cout << "    [-] Αποτυχία απευθείας μετάβασης. Δοκιμή μέσω ενδιάμεσων Markers (Bridge)..." << std::endl;
+                        
+                        std::vector<int> fallback_markers = {3, 0, 2}; 
+                        bool success_via_bridge = false;
+
+                        for (int bridge_id : fallback_markers) {
+                            if (bridge_id == marker_id) continue; 
+
+                            std::string bridge_frame = (bridge_id == 0) ? "marker_base" : "marker_" + std::to_string(bridge_id);
+                            try {
+                                geometry_msgs::msg::TransformStamped t_bridge = tf_buffer->lookupTransform(
+                                    planning_frame, bridge_frame, tf2::TimePointZero, std::chrono::milliseconds(200)
+                                );
                                 
-                                if (try_direct_cartesian(target_x, target_y, false)) {
-                                    success_via_bridge = true;
-                                    break; 
-                                } else {
-                                    std::cout << "    [MARKER BRIDGE] Αποτυχία από τη γέφυρα προς τον στόχο. Θα δοκιμαστεί άλλη εναλλακτική." << std::endl;
+                                double bridge_x = t_bridge.transform.translation.x;
+                                double bridge_y = t_bridge.transform.translation.y;
+
+                                std::cout << "    [MARKER BRIDGE] Δοκιμή μετάβασης στο Marker " << bridge_id << "..." << std::endl;
+                                
+                                if (try_direct_cartesian(bridge_x, bridge_y, false)) {
+                                    std::cout << "    [MARKER BRIDGE] Επιτυχία! Τώρα προσπάθεια για τον τελικό στόχο (Marker " << marker_id << ")..." << std::endl;
+                                    
+                                    if (try_direct_cartesian(target_x, target_y, false)) {
+                                        success_via_bridge = true;
+                                        break; 
+                                    } else {
+                                        std::cout << "    [MARKER BRIDGE] Αποτυχία από τη γέφυρα προς τον στόχο. Θα δοκιμαστεί άλλη εναλλακτική." << std::endl;
+                                    }
                                 }
+                            } catch (const tf2::TransformException & ex) {
+                                continue; 
                             }
-                        } catch (const tf2::TransformException & ex) {
-                            continue; 
                         }
+
+                        if (!success_via_bridge) {
+                            std::cout << "    [-] Τελική Αποτυχία στην εκτέλεση " << run << ". Δεν βρέθηκε διαδρομή ούτε μέσω ενδιάμεσων Markers." << std::endl;
+                            break; 
+                        } else {
+                            if (run == 1) success_first_run = true;
+                        }
+                    } else {
+                        if (run == 1) success_first_run = true;
                     }
 
-                    if (!success_via_bridge) {
-                        std::cout << "    [-] Τελική Αποτυχία. Δεν βρέθηκε διαδρομή ούτε μέσω ενδιάμεσων Markers." << std::endl;
-                    }
+                } catch (const tf2::TransformException & ex) {
+                    std::cout << "\n[-] ΣΦΑΛΜΑ: Το Marker " << marker_id << " δεν φαίνεται στην κάμερα." << std::endl;
+                    break;
                 }
 
-            } catch (const tf2::TransformException & ex) {
-                std::cout << "\n[-] ΣΦΑΛΜΑ: Το Marker " << marker_id << " δεν φαίνεται στην κάμερα." << std::endl;
+                // Εάν απέτυχε την πρώτη φορά, διακόπτουμε το loop
+                if (run == 1 && !success_first_run) {
+                    std::cout << "[-] Εγκατάλειψη 2ης εκτέλεσης λόγω αποτυχίας της 1ης." << std::endl;
+                    break;
+                }
             }
         }
         continue;
