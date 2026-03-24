@@ -213,57 +213,42 @@ int main(int argc, char * argv[])
     return false;
   };
 
-  // --- 2. NEW: STRICT LOCKED VERTICAL MOVEMENT (Lower to Higher) ---
-  auto smart_vertical_move = [&](double z_min, double z_max) -> bool {
+  // --- 2. NEW: STRICT LOCKED VERTICAL MOVEMENT ---
+  auto smart_vertical_move = [&](double target_z) -> bool {
       geometry_msgs::msg::Pose current_pose = arm_interface.getCurrentPose().pose;
-      double current_x = current_pose.position.x;
-      double current_y = current_pose.position.y;
       
-      std::vector<double> z_heights;
-      
-      // We start searching from the lowest allowed point to the highest allowed point
-      for (double z = z_min; z <= z_max; z += 0.01) {
-          z_heights.push_back(z);
-      }
-      // Ensure the exact z_max is tested if the 1cm step skipped it
-      if (std::abs(z_heights.back() - z_max) > 0.001) {
-          z_heights.push_back(z_max);
-      }
-
-      // XY Offsets: allow 0cm up to 2cm deviations
+      // XY Offsets: allow 0cm up to 5mm deviations to avoid tight singularities
       struct Offset { double dx; double dy; };
       std::vector<Offset> xy_offsets = { 
           {0.0, 0.0}, 
-          {0.005, 0.0}, {-0.005, 0.0}, {0.0, 0.005}, {0.0, -0.005}, // 5mm cross
-          {0.005, 0.005}, {-0.005, -0.005}, {0.005, -0.005}, {-0.005, 0.005} // 5mm diagonals
+          {0.005, 0.0}, {-0.005, 0.0}, {0.0, 0.005}, {0.0, -0.005}
       };
-      moveit_msgs::msg::RobotTrajectory traj;
+      
+      std::cout << "    [*] Ξεκινάει κάθετη κίνηση προς Z=" << target_z * 100 << "cm..." << std::endl;
 
-      std::cout << "    [*] Ξεκινάει αναζήτηση κάθετης κίνησης (Z: " << z_min*100 << "-" << z_max*100 << "cm, από χαμηλά προς ψηλά)..." << std::endl;
+      for (const auto& offset : xy_offsets) {
+          // STRICT LOCK: Start with the exact current pose to maintain whatever 
+          // roll/pitch we used to successfully reach this X/Y coordinate.
+          geometry_msgs::msg::Pose target = current_pose; 
+          
+          target.position.x += offset.dx;
+          target.position.y += offset.dy;
+          target.position.z = target_z;
 
-      for (double test_z : z_heights) {
-          for (const auto& offset : xy_offsets) {
-              geometry_msgs::msg::Pose target;
-              target.position.x = current_x + offset.dx;
-              target.position.y = current_y + offset.dy;
-              target.position.z = test_z;
-              
-              // STRICT LOCK: Keep the orientation absolutely identical to home_pose
-              target.orientation = home_pose.orientation;
+          std::vector<geometry_msgs::msg::Pose> waypoints = {target};
+          moveit_msgs::msg::RobotTrajectory traj;
+          
+          // Disable jump_threshold (0.0) so it relies purely on the 1cm eef_step
+          double fraction = arm_interface.computeCartesianPath(waypoints, 0.01, 0.0, traj);
 
-              std::vector<geometry_msgs::msg::Pose> waypoints = {target};
-              
-              double fraction = arm_interface.computeCartesianPath(waypoints, 0.01, 1.5, traj);
-
-              if (fraction >= 0.95) {
-                  moveit::planning_interface::MoveGroupInterface::Plan plan;
-                  plan.trajectory_ = traj;
-                  if (arm_interface.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-                      std::cout << "    [+] Επιτυχία Κάθετης Κίνησης! Z=" << test_z*100 
-                                << "cm | X offset: " << offset.dx*100 << "cm | Y offset: " << offset.dy*100 
-                                << "cm | (Locked Orientation)" << std::endl;
-                      return true;
-                  }
+          if (fraction >= 0.95) {
+              moveit::planning_interface::MoveGroupInterface::Plan plan;
+              plan.trajectory_ = traj;
+              if (arm_interface.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                  std::cout << "    [+] Επιτυχία Κάθετης Κίνησης! "
+                            << "Offset: X=" << offset.dx*100 << "cm, Y=" << offset.dy*100 
+                            << "cm | (Locked Orientation)" << std::endl;
+                  return true;
               }
           }
       }
@@ -424,8 +409,8 @@ int main(int argc, char * argv[])
         gripper_interface.setNamedTarget("open"); 
         gripper_interface.move(); 
         
-        std::cout << ">>> 2. Έξυπνη Κάθοδος (Αναζήτηση 7cm έως 9.5cm)..." << std::endl;
-        if(smart_vertical_move(0.07, 0.095)) { 
+        std::cout << ">>> 2. Έξυπνη Κάθοδος (Προσέγγιση στα 8.5cm)..." << std::endl;
+        if(smart_vertical_move(0.085)) { 
             
             std::cout << ">>> [Αναμονή 1 δευτερόλεπτο για σταθεροποίηση]..." << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -436,8 +421,8 @@ int main(int argc, char * argv[])
             
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-            std::cout << ">>> 4. Έξυπνη Άνοδος (Αναζήτηση 25cm έως 30cm)..." << std::endl;
-            smart_vertical_move(0.25, 0.30); 
+            std::cout << ">>> 4. Έξυπνη Άνοδος (Επιστροφή στα 28cm)..." << std::endl;
+            smart_vertical_move(0.28); 
             
             std::cout << ">>> Το Pick ολοκληρώθηκε!" << std::endl;
         }
@@ -448,8 +433,8 @@ int main(int argc, char * argv[])
     if (line == "D" || line == "d") {
         std::cout << "\n>>> ΕΚΤΕΛΕΣΗ DROP/PLACE (ΣΤΗΝ ΤΡΕΧΟΥΣΑ ΘΕΣΗ X, Y)..." << std::endl;
         
-        std::cout << ">>> 1. Έξυπνη Κάθοδος (Αναζήτηση 7cm έως 9.5cm)..." << std::endl;
-        if(smart_vertical_move(0.07, 0.095)) { 
+        std::cout << ">>> 1. Έξυπνη Κάθοδος (Προσέγγιση στα 8.5cm)..." << std::endl;
+        if(smart_vertical_move(0.085)) { 
             
             std::cout << ">>> [Αναμονή 1 δευτερόλεπτο για σταθεροποίηση]..." << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -460,8 +445,8 @@ int main(int argc, char * argv[])
             
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             
-            std::cout << ">>> 3. Έξυπνη Άνοδος (Αναζήτηση 25cm έως 30cm)..." << std::endl;
-            smart_vertical_move(0.25, 0.30); 
+            std::cout << ">>> 3. Έξυπνη Άνοδος (Επιστροφή στα 28cm)..." << std::endl;
+            smart_vertical_move(0.28); 
 
             std::cout << ">>> 4. Κλείσιμο Gripper..." << std::endl;
             gripper_interface.setNamedTarget("closed"); 
