@@ -98,7 +98,19 @@ int main(int argc, char * argv[])
         return std::abs(a - current_z) < std::abs(b - current_z);
     });
 
-    std::vector<double> coarse_roll = {0.0, 0.261, -0.261, 0.523, -0.523}; 
+    // --- Δυναμική Παραγωγή Ανοχής Roll ---
+    // Ορίζεις τη μέγιστη γωνία και το βήμα (σε μοίρες για ευκολία)
+    double max_roll_deg = 180; // Μέγιστη ανοχή ±80 μοίρες 
+    double step_deg = 4.0;      // Βήμα ανά 4 μοίρες (παράγει 0, 4, -4, 8, -8 κλπ.)
+
+    std::vector<double> coarse_roll;
+    coarse_roll.push_back(0.0); // Πάντα προτεραιότητα στο 0 (καθόλου περιστροφή)
+    
+    for (double angle = step_deg; angle <= max_roll_deg; angle += step_deg) {
+        double rad = angle * M_PI / 180.0;
+        coarse_roll.push_back(rad);
+        coarse_roll.push_back(-rad);
+    }
 
     struct Offset { double dx; double dy; };
     std::vector<Offset> xy_offsets = {
@@ -386,7 +398,69 @@ int main(int argc, char * argv[])
                         if (!success_via_bridge) {
                             std::cout << "    [-] Τελική Αποτυχία στην εκτέλεση " << run << ". Δεν βρέθηκε διαδρομή ούτε μέσω ενδιάμεσων Markers." << std::endl;
                             break; 
-                        } else {
+                        } else {#include <memory>
+#include <thread>
+#include <iostream>
+#include <string>
+#include <sstream>
+#include <vector>
+#include <iomanip>
+#include <cmath>
+#include <chrono>
+#include <algorithm> 
+#include <functional> 
+
+#include <rclcpp/rclcpp.hpp>
+#include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit_msgs/msg/collision_object.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+#include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h> 
+
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+
+void printPose(const geometry_msgs::msg::Pose& pose) {
+    double r, p, y;
+    tf2::Quaternion q(pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w);
+    tf2::Matrix3x3(q).getRPY(r, p, y);
+    
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "[ΤΡΕΧΟΥΣΑ ΘΕΣΗ]: X=" << pose.position.x 
+              << ", Y=" << pose.position.y 
+              << ", Z=" << pose.position.z 
+              << " | RPY (deg): " << (r * 180.0 / M_PI) << ", " 
+              << (p * 180.0 / M_PI) << ", " 
+              << (y * 180.0 / M_PI) << std::endl;
+}
+
+int main(int argc, char * argv[])
+{
+  rclcpp::init(argc, argv);
+  auto const node = std::make_shared<rclcpp::Node>("cartesian_cube_search_node");
+
+  auto executor = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
+  executor->add_node(node);
+  std::thread([executor]() { executor->spin(); }).detach();
+
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer = std::make_unique<tf2_ros::Buffer>(node->get_clock());
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
+
+  using moveit::planning_interface::MoveGroupInterface;
+  MoveGroupInterface arm_interface(node, "arm_group"); 
+  MoveGroupInterface gripper_interface(node, "gripper"); 
+  
+  arm_interface.setPlanningTime(1.0);
+  arm_interface.setMaxVelocityScalingFactor(0.3); 
+  arm_interface.setMaxAccelerationScalingFactor(0.3);
+
+  // --- Adding the floor as collision ---
+  moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
+  moveit_msgs::msg::CollisionObject collision_object;
+
                             if (run == 1) success_first_run = true;
                         }
                     } else {
