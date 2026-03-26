@@ -1,0 +1,292 @@
+#include <memory>
+#include <thread>
+#include <iostream>
+#include <string>
+#include <sstream>
+#include <vector>
+#include <iomanip>
+#include <cmath>
+#include <chrono>
+#include <algorithm> 
+#include <functional> 
+
+#include <rclcpp/rclcpp.hpp>
+#include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit_msgs/msg/collision_object.hpp>
+#include <moveit_msgs/msg/constraints.hpp>
+#include <moveit_msgs/msg/orientation_constraint.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h> 
+
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+
+void printPose(const geometry_msgs::msg::Pose& pose) {
+    double r, p, y;
+    tf2::Quaternion q(pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w);
+    tf2::Matrix3x3(q).getRPY(r, p, y);
+    
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "[ΤΡΕΧΟΥΣΑ ΘΕΣΗ]: X=" << pose.position.x 
+              << ", Y=" << pose.position.y 
+              << ", Z=" << pose.position.z 
+              << " | RPY (deg): " << (r * 180.0 / M_PI) << ", " 
+              << (p * 180.0 / M_PI) << ", " 
+              << (y * 180.0 / M_PI) << std::endl;
+}
+
+int main(int argc, char * argv[])
+{
+  rclcpp::init(argc, argv);
+  
+  rclcpp::NodeOptions node_options;
+  node_options.automatically_declare_parameters_from_overrides(true);
+  auto const node = std::make_shared<rclcpp::Node>("constrained_arm_node", node_options);
+
+  auto executor = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
+  executor->add_node(node);
+  std::thread([executor]() { executor->spin(); }).detach();
+
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer = std::make_unique<tf2_ros::Buffer>(node->get_clock());
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
+
+  using moveit::planning_interface::MoveGroupInterface;
+  MoveGroupInterface arm_interface(node, "arm_group"); 
+  MoveGroupInterface gripper_interface(node, "gripper"); 
+  
+  // Give the constrained planner more time to sample points
+  arm_interface.setPlanningTime(5.0); 
+  arm_interface.setMaxVelocityScalingFactor(0.3); 
+  arm_interface.setMaxAccelerationScalingFactor(0.3);
+
+  // --- Adding the floor as collision ---
+  moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
+  moveit_msgs::msg::CollisionObject collision_object;
+  collision_object.header.frame_id = arm_interface.getPlanningFrame();
+  collision_object.id = "floor";
+  shape_msgs::msg::SolidPrimitive primitive;
+  primitive.type = primitive.BOX;
+  primitive.dimensions = {2.0, 2.0, 0.04}; 
+  geometry_msgs::msg::Pose box_pose;
+  box_pose.position.z = -0.04; 
+  collision_object.primitives.push_back(primitive);
+  collision_object.primitive_poses.push_back(box_pose);
+  collision_object.operation = collision_object.ADD;
+  planning_scene_interface.applyCollisionObjects({collision_object});
+
+  // =========================================================================
+  // Define Home Pose (Our Pure Vertical Baseline)
+  // =========================================================================
+  geometry_msgs::msg::Pose home_pose;
+  home_pose.position.x = -0.15;
+  home_pose.position.y = -0.2;
+  home_pose.position.z = 0.25; 
+  tf2::Quaternion q_home;
+  q_home.setRPY(M_PI, -M_PI/2.0, -M_PI/2.0); // Adjust this if your arm's vertical is different
+  home_pose.orientation.x = q_home.x();
+  home_pose.orientation.y = q_home.y();
+  home_pose.orientation.z = q_home.z();
+  home_pose.orientation.w = q_home.w();
+
+  // --- 1. JOINT-SPACE SEARCH WITH STRICT MID-AIR CONSTRAINTS ---
+  auto try_constrained_move = [&](double target_x, double target_y) -> bool {
+      // Test different starting rolls to find an IK solution that avoids joint limits
+      std::vector<double> test_rolls = {0.0, 0.261, -0.261, 0.523, -0.523, M_PI/2, -M_PI/2, M_PI, -M_PI}; 
+      
+      std::cout << "    [*] Αναζήτηση διαδρομής (Αυστηρά κλειδωμένο Pitch/Yaw σε όλη την κίνηση)..." << std::endl;
+
+      for (double test_roll : test_rolls) {
+          geometry_msgs::msg::Pose target;
+          target.position.x = target_x;
+          target.position.y = target_y;
+          target.position.z = 0.25; // Target height
+
+          // Calculate final pose orientation with the test roll
+          tf2::Quaternion q_base(home_pose.orientation.x, home_pose.orientation.y, 
+                                 home_pose.orientation.z, home_pose.orientation.w);
+          tf2::Quaternion q_rot;
+          q_rot.setRPY(test_roll, 0, 0); 
+          tf2::Quaternion q_target = q_base * q_rot;
+          q_target.normalize();
+
+          target.orientation.x = q_target.x(); target.orientation.y = q_target.y();
+          target.orientation.z = q_target.z(); target.orientation.w = q_target.w();
+
+          arm_interface.setPoseTarget(target);
+
+          // === THE CORE FIX: CONTINUOUS PATH CONSTRAINTS ===
+          moveit_msgs::msg::OrientationConstraint ocm;
+          ocm.link_name = arm_interface.getEndEffectorLink();
+          ocm.header.frame_id = arm_interface.getPlanningFrame();
+          
+          // CRITICAL: Reference the pure vertical home orientation, NOT the rolled target
+          ocm.orientation = home_pose.orientation; 
+          
+          // Tight constraints on Pitch and Yaw. Large constraint (2*PI) on Roll.
+          ocm.absolute_x_axis_tolerance = 0.05;   
+          ocm.absolute_y_axis_tolerance = 0.05;   
+          ocm.absolute_z_axis_tolerance = 2.0 * M_PI; 
+          
+          // CRITICAL: Use ROTATION_VECTOR to prevent Euler angle flipping mid-air
+          ocm.parameterization = moveit_msgs::msg::OrientationConstraint::ROTATION_VECTOR;
+          ocm.weight = 1.0;
+
+          moveit_msgs::msg::Constraints path_constraints;
+          path_constraints.orientation_constraints.push_back(ocm);
+          arm_interface.setPathConstraints(path_constraints);
+
+          moveit::planning_interface::MoveGroupInterface::Plan my_plan;
+          bool success = (arm_interface.plan(my_plan) == moveit::core::MoveItErrorCode::SUCCESS);
+
+          if (success) {
+              std::cout << "    [+] Βρέθηκε ασφαλής διαδρομή! Roll=" << test_roll*180/M_PI << "°. Εκτέλεση..." << std::endl;
+              arm_interface.execute(my_plan);
+              arm_interface.clearPathConstraints(); // Clear on success
+              return true;
+          }
+          
+          arm_interface.clearPathConstraints(); // Clear before next loop iteration
+      }
+
+      std::cout << "    [-] Αποτυχία εύρεσης διαδρομής που να σέβεται τους περιορισμούς." << std::endl;
+      return false;
+  };
+
+  // --- 2. STRICT LOCKED VERTICAL MOVEMENT (Also using Joint Space Constraints) ---
+  auto smart_vertical_move = [&](double target_z) -> bool {
+      std::cout << "    [*] Ξεκινάει κάθετη κίνηση προς Z=" << target_z * 100 << "cm..." << std::endl;
+
+      geometry_msgs::msg::Pose current_pose = arm_interface.getCurrentPose().pose;
+      geometry_msgs::msg::Pose target = current_pose; 
+      target.position.z = target_z;
+      
+      arm_interface.setPoseTarget(target);
+
+      // Lock ALL axes for vertical movement
+      moveit_msgs::msg::OrientationConstraint ocm;
+      ocm.link_name = arm_interface.getEndEffectorLink();
+      ocm.header.frame_id = arm_interface.getPlanningFrame();
+      ocm.orientation = current_pose.orientation; 
+      ocm.absolute_x_axis_tolerance = 0.05;
+      ocm.absolute_y_axis_tolerance = 0.05;
+      ocm.absolute_z_axis_tolerance = 0.05; // Lock roll too
+      ocm.parameterization = moveit_msgs::msg::OrientationConstraint::ROTATION_VECTOR;
+      ocm.weight = 1.0;
+
+      moveit_msgs::msg::Constraints path_constraints;
+      path_constraints.orientation_constraints.push_back(ocm);
+      arm_interface.setPathConstraints(path_constraints);
+
+      moveit::planning_interface::MoveGroupInterface::Plan plan;
+      bool success = (arm_interface.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+
+      if (success) {
+          std::cout << "    [+] Επιτυχία Κάθετης Κίνησης!" << std::endl;
+          arm_interface.execute(plan);
+          arm_interface.clearPathConstraints();
+          return true;
+      }
+      
+      std::cout << "    [-] Αποτυχία εύρεσης κάθετης διαδρομής." << std::endl;
+      arm_interface.clearPathConstraints();
+      return false;
+  };
+
+  // --- 3. Rotating the last joint ---
+  auto rotate_last_joint = [&](double delta_angle) -> bool {
+      std::cout << "    [JOINT ROTATION] Περιστροφή τελευταίας άρθρωσης κατά " 
+                << delta_angle * 180.0 / M_PI << " μοίρες." << std::endl;
+
+      std::vector<double> joint_values = arm_interface.getCurrentJointValues();
+      if (joint_values.empty()) return false;
+
+      int last_joint_index = joint_values.size() - 1;
+      joint_values[last_joint_index] += delta_angle;
+      arm_interface.setJointValueTarget(joint_values);
+
+      moveit::planning_interface::MoveGroupInterface::Plan plan;
+      if (arm_interface.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+          arm_interface.execute(plan);
+          return true;
+      }
+      std::cout << "    [-] Σφάλμα. Η άρθρωση φτάνει σε όριο!" << std::endl;
+      return false;
+  };
+
+  RCLCPP_INFO(node->get_logger(), "Starting the procedure...");
+
+  std::cout << ">>> Μετάβαση στην Αρχική Θέση (Home) με κάθετο προσανατολισμό..." << std::endl;
+  arm_interface.clearPoseTargets();
+  arm_interface.setPoseTarget(home_pose);
+  if (arm_interface.move() != moveit::core::MoveItErrorCode::SUCCESS) {
+      RCLCPP_ERROR(node->get_logger(), "Αποτυχία μετάβασης στην Αρχική Θέση!");
+  }
+
+  std::cout << ">>> Το σύστημα είναι έτοιμο." << std::endl;
+
+  while (rclcpp::ok()) {
+    std::cout << "\n================================================" << std::endl;
+    arm_interface.setStartStateToCurrentState();
+    printPose(arm_interface.getCurrentPose().pose);
+
+    std::cout << "Commands: P (Pick), D (Drop), pour (Pour), O (Open), C (Close), <X> <Y> (Μετάβαση)\nCommand: ";
+    std::string line;
+    std::getline(std::cin, line);
+    if (line.empty()) continue;
+
+    if (line == "O" || line == "o") { gripper_interface.setNamedTarget("open"); gripper_interface.move(); continue; } 
+    if (line == "C" || line == "c") { gripper_interface.setNamedTarget("closed"); gripper_interface.move(); continue; }
+
+    if (line == "pour" || line == "POUR" || line == "Pour") {
+        std::cout << "\n>>> ΕΚΤΕΛΕΣΗ POUR..." << std::endl;
+        if(rotate_last_joint(M_PI / 2.0)) { 
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+            rotate_last_joint(-M_PI / 2.0); 
+            std::cout << ">>> Ολοκληρώθηκε επιτυχώς!" << std::endl;
+        }
+        continue;
+    }
+
+    if (line == "P" || line == "p") {
+        std::cout << "\n>>> ΕΚΤΕΛΕΣΗ PICK..." << std::endl;
+        gripper_interface.setNamedTarget("open"); gripper_interface.move(); 
+        if(smart_vertical_move(0.085)) { 
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            gripper_interface.setNamedTarget("closed"); gripper_interface.move(); 
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            smart_vertical_move(0.25); // Return to safe Z
+            std::cout << ">>> Το Pick ολοκληρώθηκε!" << std::endl;
+        }
+        continue;
+    }
+
+    if (line == "D" || line == "d") {
+        std::cout << "\n>>> ΕΚΤΕΛΕΣΗ DROP/PLACE..." << std::endl;
+        if(smart_vertical_move(0.085)) { 
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            gripper_interface.setNamedTarget("open"); gripper_interface.move(); 
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            smart_vertical_move(0.25); // Return to safe Z
+            gripper_interface.setNamedTarget("closed"); gripper_interface.move();
+            std::cout << ">>> Το Drop/Place ολοκληρώθηκε!" << std::endl;
+        }
+        continue;
+    }
+
+    // --- ΕΝΤΟΛΗ: ΑΠΛΗ ΜΕΤΑΒΑΣΗ ΣΕ X, Y ΣΥΝΤΕΤΑΓΜΕΝΕΣ ---
+    std::stringstream ss(line); 
+    double tx, ty;
+    if (ss >> tx >> ty) {
+        std::cout << "\n>>> ΕΚΤΕΛΕΣΗ ΜΕΤΑΒΑΣΗΣ: Στόχος X=" << tx << "m, Y=" << ty << "m (Z=0.25m)" << std::endl;
+        try_constrained_move(tx, ty);
+        continue;
+    } else {
+        std::cout << "[-] Άγνωστη ή λανθασμένη εντολή. Δοκιμάστε ξανά." << std::endl;
+    }
+  }
+  rclcpp::shutdown();
+  return 0;
+}
