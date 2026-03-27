@@ -22,7 +22,7 @@ int main(int argc, char * argv[])
     // 1. SYSTEM INITIALIZATION
     // =========================================================================
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<rclcpp::Node>("interactive_position_planner");
+    auto node = std::make_shared<rclcpp::Node>("interactive_pose_planner");
 
     // =========================================================================
     // 2. BACKGROUND THREADING
@@ -45,22 +45,18 @@ int main(int argc, char * argv[])
     // 4. INITIAL STARTUP MOTION (EXACT POSE)
     // =========================================================================
     std::cout << ">>> Moving to initial position (X:0.0, Y:-0.2, Z:0.2) ..." << std::endl;
-    std::cout << ">>> Orientation: Horizontal (Roll=0, Pitch=0, Yaw=0) ..." << std::endl;
+    std::cout << ">>> Orientation: Roll=0, Pitch=-90, Yaw=90 ..." << std::endl;
 
-    // Clear any old targets or restrictive path constraints
     arm_interface.clearPoseTargets();
     arm_interface.clearPathConstraints();
 
-    // Create a precise destination Pose
     geometry_msgs::msg::Pose start_pose;
     start_pose.position.x = 0.0;
     start_pose.position.y = -0.2;
     start_pose.position.z = 0.2;
 
-    // Set the exact orientation based on your RViz image
+    // We define your perfect orientation here
     tf2::Quaternion q_start;
-    // Roll=0, Pitch=0 keeps it level (Blue up, Red forward)
-    // If it faces the wrong way, change the third 0.0 to M_PI/2.0 or -M_PI/2.0
     q_start.setRPY(0.0, -M_PI/2.0, M_PI/2.0); 
     
     start_pose.orientation.x = q_start.x();
@@ -68,10 +64,7 @@ int main(int argc, char * argv[])
     start_pose.orientation.z = q_start.z();
     start_pose.orientation.w = q_start.w();
 
-    // Tell MoveIt to figure out the easiest path to this exact destination
     arm_interface.setPoseTarget(start_pose);
-    
-    // Give it a standard amount of time to think
     arm_interface.setPlanningTime(2.0); 
     
     MoveGroupInterface::Plan initial_plan;
@@ -81,17 +74,16 @@ int main(int argc, char * argv[])
         arm_interface.execute(initial_plan);
         std::cout << ">>> Initial position reached successfully!" << std::endl;
     } else {
-        std::cout << "[-] WARNING: Failed to plan to the initial position. The coordinates might be out of reach or inside the robot's own body." << std::endl;
+        std::cout << "[-] WARNING: Failed to plan to the initial position." << std::endl;
     }
 
-    // Reset so the interactive loop doesn't inherit this orientation
     arm_interface.clearPoseTargets();
     arm_interface.setPlanningTime(1.0); 
 
     std::cout << "\n>>> MoveIt 2 Interactive Planner Ready." << std::endl;
 
     // =========================================================================
-    // 5. INTERACTIVE COMMAND LOOP (POSITION ONLY)
+    // 5. INTERACTIVE COMMAND LOOP (FIXED FINAL ORIENTATION)
     // =========================================================================
     while (rclcpp::ok()) {
         std::cout << "\n================================================" << std::endl;
@@ -105,19 +97,33 @@ int main(int argc, char * argv[])
         std::stringstream ss(line);
         double tx, ty, tz;
         if (ss >> tx >> ty >> tz) {
-            std::cout << ">>> Planning motion to X:" << tx << ", Y:" << ty << ", Z:" << tz << " (Free Orientation)..." << std::endl;
+            std::cout << ">>> Planning motion to X:" << tx << ", Y:" << ty << ", Z:" << tz << std::endl;
+            std::cout << ">>> (Maintaining the locked final orientation)" << std::endl;
             
-            arm_interface.setPositionTarget(tx, ty, tz);
+            // Create a new pose for the interactive target
+            geometry_msgs::msg::Pose interactive_target;
+            interactive_target.position.x = tx;
+            interactive_target.position.y = ty;
+            interactive_target.position.z = tz;
+            
+            // Re-use the exact same orientation from the startup pose
+            interactive_target.orientation.x = q_start.x();
+            interactive_target.orientation.y = q_start.y();
+            interactive_target.orientation.z = q_start.z();
+            interactive_target.orientation.w = q_start.w();
+
+            // Set this full Pose as the target
+            arm_interface.setPoseTarget(interactive_target);
+            
             MoveGroupInterface::Plan my_plan;
-            
             if (arm_interface.plan(my_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
                 arm_interface.execute(my_plan);
                 std::cout << ">>> Motion complete." << std::endl;
             } else {
-                std::cout << "[-] Failed to find a valid plan." << std::endl;
+                std::cout << "[-] Failed to find a valid plan. That coordinate might be unreachable with this specific wrist orientation." << std::endl;
             }
         } else {
-            std::cout << "[-] Invalid input." << std::endl;
+            std::cout << "[-] Invalid input. Enter three numbers separated by spaces." << std::endl;
         }
     }
 
