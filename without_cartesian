@@ -1,5 +1,3 @@
-// This code initializes a position with fixed orientation.
-
 // --- Standard C++ Libraries ---
 #include <memory>   
 #include <thread>   
@@ -82,8 +80,8 @@ int main(int argc, char * argv[])
 
     std::cout << "\n>>> MoveIt 2 Interactive Planner Ready." << std::endl;
 
-    // =========================================================================
-    // 5. INTERACTIVE COMMAND LOOP (FIXED FINAL ORIENTATION)
+// =========================================================================
+    // 5. INTERACTIVE COMMAND LOOP (FIXED PITCH/YAW, EXPLORING ROLL)
     // =========================================================================
     while (rclcpp::ok()) {
         std::cout << "\n================================================" << std::endl;
@@ -98,30 +96,49 @@ int main(int argc, char * argv[])
         double tx, ty, tz;
         if (ss >> tx >> ty >> tz) {
             std::cout << ">>> Planning motion to X:" << tx << ", Y:" << ty << ", Z:" << tz << std::endl;
-            std::cout << ">>> (Maintaining the locked final orientation)" << std::endl;
+            std::cout << ">>> (Pitch=-90°, Yaw=90°, exploring possible Roll angles...)" << std::endl;
             
-            // Create a new pose for the interactive target
-            geometry_msgs::msg::Pose interactive_target;
-            interactive_target.position.x = tx;
-            interactive_target.position.y = ty;
-            interactive_target.position.z = tz;
-            
-            // Re-use the exact same orientation from the startup pose
-            interactive_target.orientation.x = q_start.x();
-            interactive_target.orientation.y = q_start.y();
-            interactive_target.orientation.z = q_start.z();
-            interactive_target.orientation.w = q_start.w();
-
-            // Set this full Pose as the target
-            arm_interface.setPoseTarget(interactive_target);
-            
+            bool plan_found = false;
             MoveGroupInterface::Plan my_plan;
-            if (arm_interface.plan(my_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+
+            // Try 8 different roll angles, from -180 to +180 degrees (steps of 45 degrees / pi/4)
+            for (double r = -M_PI; r <= M_PI; r += M_PI / 4.0) {
+                
+                geometry_msgs::msg::Pose target_pose;
+                target_pose.position.x = tx;
+                target_pose.position.y = ty;
+                target_pose.position.z = tz;
+                
+                tf2::Quaternion q;
+                // Here is the magic: Roll is dynamic (r), Pitch and Yaw are locked
+                q.setRPY(r, -M_PI/2.0, M_PI/2.0); 
+                
+                target_pose.orientation.x = q.x();
+                target_pose.orientation.y = q.y();
+                target_pose.orientation.z = q.z();
+                target_pose.orientation.w = q.w();
+
+                arm_interface.setPoseTarget(target_pose);
+                
+                // Attempt to plan. If it succeeds, we break the loop and execute!
+                if (arm_interface.plan(my_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                    std::cout << "    [+] Found valid plan with Roll = " << (r * 180.0 / M_PI) << "°" << std::endl;
+                    plan_found = true;
+                    break; 
+                }
+            }
+
+            if (plan_found) {
+                std::cout << ">>> Executing path (unconstrained transit)..." << std::endl;
                 arm_interface.execute(my_plan);
                 std::cout << ">>> Motion complete." << std::endl;
             } else {
-                std::cout << "[-] Failed to find a valid plan. That coordinate might be unreachable with this specific wrist orientation." << std::endl;
+                std::cout << "[-] Failed to find a valid plan for ANY Roll angle at these coordinates." << std::endl;
             }
+            
+            // Clear the target so the next loop starts fresh
+            arm_interface.clearPoseTargets();
+
         } else {
             std::cout << "[-] Invalid input. Enter three numbers separated by spaces." << std::endl;
         }
