@@ -105,9 +105,11 @@ int main(int argc, char * argv[])
 
         // --- C. GOAL SEARCH (FAST IK CHECKING) ---
         std::vector<double> roll_offsets = {0.0};
-        for (int i = 1; i <= 180; i += 1) { 
-            roll_offsets.push_back(i * M_PI / 180.0);
-            roll_offsets.push_back(-i * M_PI / 180.0);
+        for (int i = 1; i <= 1800; i += 1) {
+        
+            double angle_in_rads = (i * 0.1) * (M_PI / 180.0);
+            roll_offsets.push_back(angle_in_rads);
+            roll_offsets.push_back(-angle_in_rads);
         }
 
         // Get the underlying kinematic state to perform lightning-fast math checks
@@ -134,8 +136,8 @@ int main(int argc, char * argv[])
             target.orientation.z = q_final.z();
             target.orientation.w = q_final.w();
 
-            // CHECK INVERSE KINEMATICS DIRECTLY (Timeout: 0.05 seconds per check)
-            bool found_kinematic_solution = kinematic_state->setFromIK(joint_model_group, target, 0.05);
+            // CHECK INVERSE KINEMATICS DIRECTLY (Timeout: 0.01 seconds per check)
+            bool found_kinematic_solution = kinematic_state->setFromIK(joint_model_group, target, 0.02);
             
             if (found_kinematic_solution) {
                 best_target = target;
