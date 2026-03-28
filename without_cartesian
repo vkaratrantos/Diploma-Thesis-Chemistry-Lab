@@ -32,9 +32,9 @@ int main(int argc, char * argv[])
     using moveit::planning_interface::MoveGroupInterface;
     MoveGroupInterface arm_interface(node, "arm_group"); 
 
-    arm_interface.setPlanningTime(1.0);
+    arm_interface.setPlanningTime(10.0);
     arm_interface.setMaxVelocityScalingFactor(0.3);
-    arm_interface.setMaxAccelerationScalingFactor(0.3);
+    arm_interface.setMaxAccelerationScalingFactor(0.);
 
     // =========================================================================
     // 2. INITIAL MOTION TO START POINT
@@ -89,8 +89,8 @@ int main(int argc, char * argv[])
         // Roll is completely free. Pitch/Yaw get 0.4 rad (~23 deg) to absorb 
         // starting point floating-point errors without instantly failing.
         ocm.absolute_x_axis_tolerance = 3.14159; 
-        ocm.absolute_y_axis_tolerance = 0.15; 
-        ocm.absolute_z_axis_tolerance = 0.15; 
+        ocm.absolute_y_axis_tolerance = 0.2; 
+        ocm.absolute_z_axis_tolerance = 0.2; 
         ocm.weight = 1.0;
 
         moveit_msgs::msg::Constraints path_constraints;
@@ -99,19 +99,23 @@ int main(int argc, char * argv[])
 
         // --- B. PLANNER SETTINGS ---
         arm_interface.setPlannerId("RRTConnectkConfigDefault");
-        arm_interface.setPlanningTime(0.5); // Back down to 10s now that math is fixed
+        arm_interface.setPlanningTime(10.0); // Back down to 10s now that math is fixed
         arm_interface.setGoalPositionTolerance(0.02); 
         arm_interface.setGoalOrientationTolerance(0.4); 
 
-        // --- C. GOAL SEARCH (QUATERNION ROTATION) ---
+        // --- C. GOAL SEARCH (FAST IK CHECKING) ---
         std::vector<double> roll_offsets = {0.0};
         for (int i = 1; i <= 180; i += 1) { 
             roll_offsets.push_back(i * M_PI / 180.0);
             roll_offsets.push_back(-i * M_PI / 180.0);
         }
 
-        bool plan_found = false;
-        MoveGroupInterface::Plan my_plan;
+        // Get the underlying kinematic state to perform lightning-fast math checks
+        moveit::core::RobotStatePtr kinematic_state = arm_interface.getCurrentState();
+        const moveit::core::JointModelGroup* joint_model_group = kinematic_state->getJointModelGroup("arm_group");
+
+        bool ik_found = false;
+        geometry_msgs::msg::Pose best_target;
 
         for (double roll : roll_offsets) {
             geometry_msgs::msg::Pose target;
@@ -130,24 +134,31 @@ int main(int argc, char * argv[])
             target.orientation.z = q_final.z();
             target.orientation.w = q_final.w();
 
-            arm_interface.setPoseTarget(target);
+            // CHECK INVERSE KINEMATICS DIRECTLY (Timeout: 0.05 seconds per check)
+            bool found_kinematic_solution = kinematic_state->setFromIK(joint_model_group, target, 0.05);
             
-            if (arm_interface.plan(my_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-                plan_found = true;
-                break;
+            if (found_kinematic_solution) {
+                best_target = target;
+                ik_found = true;
+                std::cout << ">>> Valid IK found at roll: " << roll * (180.0 / M_PI) << " degrees." << std::endl;
+                break; // Stop immediately! We found the one closest to 0.
             }
         }
 
-        if (plan_found) {
-            std::cout << ">>> Plan found! Executing..." << std::endl;
-            arm_interface.execute(my_plan);
+        // --- D. PLAN AND EXECUTE THE WINNING POSE ---
+        if (ik_found) {
+            arm_interface.setPoseTarget(best_target);
+            MoveGroupInterface::Plan my_plan;
+            
+            std::cout << ">>> Planning trajectory to valid pose..." << std::endl;
+            if (arm_interface.plan(my_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                arm_interface.execute(my_plan);
+            } else {
+                std::cout << "[-] Pose is reachable, but path is blocked by collisions!" << std::endl;
+            }
         } else {
-            std::cout << "[-] Planner timed out or goal unreachable." << std::endl;
+            std::cout << "[-] Point is completely unreachable at any roll angle." << std::endl;
         }
-
-        // --- D. CLEANUP ---
-        arm_interface.clearPathConstraints();
-        arm_interface.clearPoseTargets();
     }
 
     rclcpp::shutdown();
