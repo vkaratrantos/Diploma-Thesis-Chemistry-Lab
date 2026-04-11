@@ -11,6 +11,7 @@
 #include <rclcpp/rclcpp.hpp> 
 #include <moveit/move_group_interface/move_group_interface.h> 
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit/planning_scene/planning_scene.h> 
 #include <moveit_msgs/msg/collision_object.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
 #include <geometry_msgs/msg/pose.hpp>
@@ -34,7 +35,7 @@ int main(int argc, char * argv[])
 
     arm_interface.setPlanningTime(10.0);
     arm_interface.setMaxVelocityScalingFactor(0.3);
-    arm_interface.setMaxAccelerationScalingFactor(0.);
+    arm_interface.setMaxAccelerationScalingFactor(0.3);
 
     // =========================================================================
     // 2. INITIAL MOTION TO START POINT
@@ -80,17 +81,16 @@ int main(int argc, char * argv[])
         ocm.link_name = arm_interface.getEndEffectorLink();
         ocm.header.frame_id = arm_interface.getPlanningFrame();
         
-        // THE FIX: Do not use getCurrentPose(). Hardcode the upright baseline!
+        // Hardcode the upright baseline to prevent floating point drift
         ocm.orientation.x = q_upright.x();
         ocm.orientation.y = q_upright.y();
         ocm.orientation.z = q_upright.z();
         ocm.orientation.w = q_upright.w();
 
-        // Roll is completely free. Pitch/Yaw get 0.4 rad (~23 deg) to absorb 
-        // starting point floating-point errors without instantly failing.
+        // Roll is completely free. Pitch/Yaw get 0.3 rad tolerance.
         ocm.absolute_x_axis_tolerance = 3.14159; 
-        ocm.absolute_y_axis_tolerance = 0.2; 
-        ocm.absolute_z_axis_tolerance = 0.2; 
+        ocm.absolute_y_axis_tolerance = 0.3; 
+        ocm.absolute_z_axis_tolerance = 0.3; 
         ocm.weight = 1.0;
 
         moveit_msgs::msg::Constraints path_constraints;
@@ -98,26 +98,40 @@ int main(int argc, char * argv[])
         arm_interface.setPathConstraints(path_constraints);
 
         // --- B. PLANNER SETTINGS ---
-        arm_interface.setPlannerId("RRTConnectkConfigDefault");
-        arm_interface.setPlanningTime(10.0); // Back down to 10s now that math is fixed
+        // Using RRTConnect to leverage the newly configured Constrained State Space in YAML
+        arm_interface.setPlannerId("RRTstarkConfigDefault");
         arm_interface.setGoalPositionTolerance(0.02); 
         arm_interface.setGoalOrientationTolerance(0.4); 
+        arm_interface.setNumPlanningAttempts(5); 
 
-        // --- C. GOAL SEARCH (FAST IK CHECKING) ---
+        // --- C & D. GOAL SEARCH & ITERATIVE PLANNING (FAIL FAST ARCHITECTURE) ---
         std::vector<double> roll_offsets = {0.0};
         for (int i = 1; i <= 1800; i += 1) {
-        
             double angle_in_rads = (i * 0.1) * (M_PI / 180.0);
             roll_offsets.push_back(angle_in_rads);
             roll_offsets.push_back(-angle_in_rads);
         }
 
-        // Get the underlying kinematic state to perform lightning-fast math checks
+        // Refresh state and create planning scene for collision checking
         moveit::core::RobotStatePtr kinematic_state = arm_interface.getCurrentState();
         const moveit::core::JointModelGroup* joint_model_group = kinematic_state->getJointModelGroup("arm_group");
+        auto planning_scene = std::make_shared<planning_scene::PlanningScene>(arm_interface.getRobotModel());
+        
+        // Define the self-collision callback
+        moveit::core::GroupStateValidityCallbackFn collision_callback = 
+            [&planning_scene](moveit::core::RobotState* robot_state, 
+                              const moveit::core::JointModelGroup* joint_group, 
+                              const double* joint_group_variable_values) {
+                robot_state->setJointGroupPositions(joint_group, joint_group_variable_values);
+                robot_state->update();
+                return !planning_scene->isStateColliding(*robot_state, joint_group->getName());
+            };
 
-        bool ik_found = false;
-        geometry_msgs::msg::Pose best_target;
+        bool successful_move = false;
+
+        // Set an aggressive planning timeout. If it can't find a path in 3 seconds, 
+        // it fails fast and moves to the next wrist angle.
+        arm_interface.setPlanningTime(3.0); 
 
         for (double roll : roll_offsets) {
             geometry_msgs::msg::Pose target;
@@ -136,30 +150,31 @@ int main(int argc, char * argv[])
             target.orientation.z = q_final.z();
             target.orientation.w = q_final.w();
 
-            // CHECK INVERSE KINEMATICS DIRECTLY (Timeout: 0.01 seconds per check)
-            bool found_kinematic_solution = kinematic_state->setFromIK(joint_model_group, target, 0.02);
+            // 1. Check if the pose is mathematically valid AND collision-free
+            bool found_valid_solution = kinematic_state->setFromIK(joint_model_group, target, 0.02, collision_callback);
             
-            if (found_kinematic_solution) {
-                best_target = target;
-                ik_found = true;
-                std::cout << ">>> Valid IK found at roll: " << roll * (180.0 / M_PI) << " degrees." << std::endl;
-                break; // Stop immediately! We found the one closest to 0.
+            if (found_valid_solution) {
+                std::cout << "\n>>> Valid & Collision-Free IK found at roll: " 
+                          << roll * (180.0 / M_PI) << " degrees. Attempting plan..." << std::endl;
+                
+                // 2. Attempt to plan the path immediately
+                arm_interface.setPoseTarget(target);
+                MoveGroupInterface::Plan my_plan;
+                
+                if (arm_interface.plan(my_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                    std::cout << ">>> Path found! Executing trajectory..." << std::endl;
+                    arm_interface.execute(my_plan);
+                    successful_move = true;
+                    break; // Mission accomplished. Stop searching!
+                } else {
+                    std::cout << "[-] Path blocked or timed out. Moving to next roll angle..." << std::endl;
+                    // Loop continues automatically to find a better angle.
+                }
             }
         }
 
-        // --- D. PLAN AND EXECUTE THE WINNING POSE ---
-        if (ik_found) {
-            arm_interface.setPoseTarget(best_target);
-            MoveGroupInterface::Plan my_plan;
-            
-            std::cout << ">>> Planning trajectory to valid pose..." << std::endl;
-            if (arm_interface.plan(my_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-                arm_interface.execute(my_plan);
-            } else {
-                std::cout << "[-] Pose is reachable, but path is blocked by collisions!" << std::endl;
-            }
-        } else {
-            std::cout << "[-] Point is completely unreachable at any roll angle." << std::endl;
+        if (!successful_move) {
+            std::cout << "\n[-] Exhausted all roll angles. Could not find a reachable AND plannable path." << std::endl;
         }
     }
 
