@@ -2,7 +2,7 @@
 // simple_move.cpp — Liquid Handler Pick & Place
 // ROS 2 Humble | MoveIt 2 | Pilz Industrial Motion Planner
 //
-// Architecture: LIFT (Cartesian) → MOVE (Pilz LIN / Constrained OMPL) → DROP (Cartesian)
+// Architecture: LIFT (Cartesian) → MOVE (Pilz/OMPL via points) → DROP (Cartesian)
 // =============================================================================
 
 // --- Standard C++ Libraries ---
@@ -94,7 +94,6 @@ bool findValidOverheadPose(
     const moveit::core::JointModelGroup * jmg =
         kinematic_state->getJointModelGroup("arm_group");
 
-    // Radial scan around Z (Yaw): keeps the tube perfectly upright!
     std::vector<int> yaw_angles = {0};
     for (int i = 1; i <= 180; i += 5) {
         yaw_angles.push_back(i);
@@ -104,7 +103,7 @@ bool findValidOverheadPose(
     for (int angle : yaw_angles) {
         double yaw = angle * (M_PI / 180.0);
         tf2::Quaternion q_rot;
-        q_rot.setRotation(tf2::Vector3(0, 0, 1), yaw); // Z-axis rotation
+        q_rot.setRotation(tf2::Vector3(0, 0, 1), yaw); 
         tf2::Quaternion q_final = (q_upright * q_rot).normalized();
 
         geometry_msgs::msg::Pose test_pose;
@@ -118,12 +117,68 @@ bool findValidOverheadPose(
 
         if (kinematic_state->setFromIK(jmg, test_pose, 0.05)) {
             out_pose = test_pose;
-            std::cout << "    Found valid IK with yaw=" << angle << " deg.\n";
             return true;
         }
     }
     return false;
 }
+
+// =============================================================================
+// HELPER: Attempt a horizontal move keeping the tube upright (LIN -> OMPL)
+// =============================================================================
+bool horizontalTransitUpright(
+    moveit::planning_interface::MoveGroupInterface & iface,
+    const geometry_msgs::msg::Pose                 & target_pose,
+    const tf2::Quaternion                          & q_upright)
+{
+    // 1. Try Pilz LIN first
+    iface.setPlanningPipelineId("pilz_industrial_motion_planner");
+    iface.setPlannerId("LIN");
+    iface.setPlanningTime(2.0);
+    iface.setPoseTarget(target_pose);
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    if (iface.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+        if (iface.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+            waitForStateSettle(iface);
+            return true;
+        }
+    }
+
+    // 2. LIN failed, fallback to Constrained OMPL
+    iface.setPlanningPipelineId("ompl");
+    iface.setPlannerId("RRTConnectkConfigDefault");
+    iface.setPlanningTime(5.0);
+    iface.setPoseTarget(target_pose);
+
+    moveit_msgs::msg::OrientationConstraint ocm;
+    ocm.link_name = iface.getEndEffectorLink();
+    ocm.header.frame_id = iface.getPlanningFrame();
+    ocm.orientation.x = q_upright.x();
+    ocm.orientation.y = q_upright.y();
+    ocm.orientation.z = q_upright.z();
+    ocm.orientation.w = q_upright.w();
+    ocm.absolute_x_axis_tolerance = 0.05; 
+    ocm.absolute_y_axis_tolerance = 0.05;
+    ocm.absolute_z_axis_tolerance = 3.14; 
+    ocm.weight = 1.0;
+
+    moveit_msgs::msg::Constraints path_constraints;
+    path_constraints.orientation_constraints.push_back(ocm);
+    iface.setPathConstraints(path_constraints);
+
+    bool success = false;
+    if (iface.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+        if (iface.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+            waitForStateSettle(iface);
+            success = true;
+        }
+    }
+    
+    iface.clearPathConstraints(); // Always clean up!
+    return success;
+}
+
 
 // =============================================================================
 // MAIN
@@ -140,7 +195,6 @@ int main(int argc, char * argv[])
     using moveit::planning_interface::MoveGroupInterface;
     MoveGroupInterface arm_interface(node, "arm_group");
 
-    // "Upright" orientation: tool pointing straight down
     tf2::Quaternion q_upright;
     q_upright.setRPY(0.0, -M_PI / 2.0, M_PI / 2.0);
 
@@ -235,16 +289,12 @@ int main(int argc, char * argv[])
         }
 
         // =================================================================
-        // PHASE 2: MOVE  — horizontal transfer at safe_z
+        // PHASE 2: MOVE  — horizontal transfer at safe_z with via-point fallback
         // =================================================================
         std::cout << "\n--- [PHASE 2] HORIZONTAL MOVE to (" << tx << ", " << ty << ") ---\n";
 
         arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
         arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_LIQUID);
-
-        arm_interface.setPlanningPipelineId("pilz_industrial_motion_planner");
-        arm_interface.setPlannerId("LIN");
-        arm_interface.setPlanningTime(2.0);
 
         geometry_msgs::msg::Pose overhead_pose;
         if (!findValidOverheadPose(arm_interface, tx, ty, safe_z, q_upright, overhead_pose)) {
@@ -252,59 +302,43 @@ int main(int argc, char * argv[])
             continue;
         }
 
-        arm_interface.setPoseTarget(overhead_pose);
-        MoveGroupInterface::Plan plan_move;
+        // Attempt 1: Direct route
+        bool moved = horizontalTransitUpright(arm_interface, overhead_pose, q_upright);
 
-        bool moved = false;
-        if (arm_interface.plan(plan_move) == moveit::core::MoveItErrorCode::SUCCESS) {
-            if (arm_interface.execute(plan_move) == moveit::core::MoveItErrorCode::SUCCESS) {
-                moved = true;
-                waitForStateSettle(arm_interface);
-            }
-        }
-
+        // Attempt 2: Route through safe via points
         if (!moved) {
-            std::cout << "    [PHASE 2] Pilz LIN failed. Falling back to CONSTRAINED OMPL...\n";
+            std::cout << "    [PHASE 2] Direct route blocked. Attempting safe via-points...\n";
             
-            arm_interface.setPlanningPipelineId("ompl");
-            arm_interface.setPlannerId("RRTConnectkConfigDefault");
-            arm_interface.setPlanningTime(5.0);
-            arm_interface.setPoseTarget(overhead_pose);
+            // Define your safe transit coordinates (using dynamic safe_z)
+            std::vector<std::pair<double, double>> via_points = {
+                {-0.15, -0.15}, 
+                {0.15, -0.15}
+            };
 
-            // Create Path Constraint to prevent spilling during OMPL transit
-            moveit_msgs::msg::OrientationConstraint ocm;
-            ocm.link_name = arm_interface.getEndEffectorLink();
-            ocm.header.frame_id = arm_interface.getPlanningFrame();
-            
-            ocm.orientation.x = q_upright.x();
-            ocm.orientation.y = q_upright.y();
-            ocm.orientation.z = q_upright.z();
-            ocm.orientation.w = q_upright.w();
-            
-            // Allow ~3 degrees of tilt, but let yaw spin freely
-            ocm.absolute_x_axis_tolerance = 0.05; 
-            ocm.absolute_y_axis_tolerance = 0.05;
-            ocm.absolute_z_axis_tolerance = 3.14; 
-            ocm.weight = 1.0;
+            for (size_t i = 0; i < via_points.size(); ++i) {
+                std::cout << "    Trying Via-Point " << i+1 << ": (" << via_points[i].first << ", " << via_points[i].second << ")...\n";
+                
+                geometry_msgs::msg::Pose via_pose;
+                if (!findValidOverheadPose(arm_interface, via_points[i].first, via_points[i].second, safe_z, q_upright, via_pose)) {
+                    std::cout << "      [!] Via-point kinematically unreachable. Skipping.\n";
+                    continue; 
+                }
 
-            moveit_msgs::msg::Constraints path_constraints;
-            path_constraints.orientation_constraints.push_back(ocm);
-            arm_interface.setPathConstraints(path_constraints);
-
-            MoveGroupInterface::Plan plan_ompl;
-            if (arm_interface.plan(plan_ompl) == moveit::core::MoveItErrorCode::SUCCESS) {
-                if (arm_interface.execute(plan_ompl) == moveit::core::MoveItErrorCode::SUCCESS) {
-                    moved = true;
-                    waitForStateSettle(arm_interface);
+                if (horizontalTransitUpright(arm_interface, via_pose, q_upright)) {
+                    std::cout << "      --> Reached Via-Point " << i+1 << ". Now heading to final target...\n";
+                    
+                    if (horizontalTransitUpright(arm_interface, overhead_pose, q_upright)) {
+                        moved = true;
+                        break; // Success! Break out of the via-point loop.
+                    } else {
+                        std::cout << "      [!] Could not reach target from Via-Point " << i+1 << ". Evaluating next option...\n";
+                    }
                 }
             }
-            
-            // IMPORTANT: Clear constraints for the next loop
-            arm_interface.clearPathConstraints();
         }
 
         if (!moved) {
-            std::cout << "[-] [PHASE 2] Both LIN and OMPL failed. Skipping.\n";
+            std::cout << "[-] [PHASE 2] All horizontal transit methods failed. Skipping.\n";
             continue;
         }
 
