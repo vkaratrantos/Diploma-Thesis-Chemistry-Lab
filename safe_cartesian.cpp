@@ -2,14 +2,7 @@
 // simple_move.cpp — Liquid Handler Pick & Place
 // ROS 2 Humble | MoveIt 2 | Pilz Industrial Motion Planner
 //
-// Architecture: LIFT (Cartesian/OMPL) → MOVE (Pilz LIN) → DROP (Cartesian/OMPL)
-// Fixes applied:
-//   1. State settling delay after each execute()
-//   2. computeCartesianPath for lift/drop (straight-line + fraction check)
-//   3. OMPL fallback when Cartesian path fraction is too low
-//   4. Pilz LIN used ONLY for horizontal transfer (Phase 2)
-//   5. Aggressive SAFE_Z margin
-//   6. Retry loop with incremental Z for lift failures
+// Architecture: LIFT (Cartesian) → MOVE (Pilz LIN / Constrained OMPL) → DROP (Cartesian)
 // =============================================================================
 
 // --- Standard C++ Libraries ---
@@ -26,28 +19,30 @@
 #include <rclcpp/rclcpp.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <moveit_msgs/msg/constraints.hpp>
+#include <moveit_msgs/msg/orientation_constraint.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 
 // =============================================================================
 // CONSTANTS
 // =============================================================================
-static constexpr double VEL_SCALE_TRANSIT  = 0.10; // Speed for OMPL moves
-static constexpr double VEL_SCALE_LIQUID   = 0.05; // Speed while carrying liquid
+static constexpr double VEL_SCALE_TRANSIT  = 0.10; 
+static constexpr double VEL_SCALE_LIQUID   = 0.05; 
 static constexpr double ACC_SCALE_TRANSIT  = 0.10;
 static constexpr double ACC_SCALE_LIQUID   = 0.05;
 
-static constexpr double CARTESIAN_EEF_STEP = 0.005; // 5 mm interpolation step
-static constexpr double CARTESIAN_JUMP_THR = 0.0;   // Disable jump threshold
+static constexpr double CARTESIAN_EEF_STEP = 0.005; 
+static constexpr double CARTESIAN_JUMP_THR = 0.0;   
 
-static constexpr double MIN_CARTESIAN_FRACTION = 0.95; // 95 % path completeness
+static constexpr double MIN_CARTESIAN_FRACTION = 0.95; 
 
-static constexpr double SAFE_Z_DEFAULT     = 0.3;  // Default transit height [m]
-static constexpr double SAFE_Z_MARGIN      = 0.12;  // Extra headroom above target
-static constexpr double SAFE_Z_RETRY_STEP  = 0.03;  // Increment when lift fails
-static constexpr double SAFE_Z_MAX_RETRY   = 0.15;  // Max extra Z to try
+static constexpr double SAFE_Z_DEFAULT     = 0.3;  
+static constexpr double SAFE_Z_MARGIN      = 0.12;  
+static constexpr double SAFE_Z_RETRY_STEP  = 0.03;  
+static constexpr double SAFE_Z_MAX_RETRY   = 0.15;  
 
-static constexpr int    STATE_SETTLE_MS    = 500;   // Wait after execute() [ms]
+static constexpr int    STATE_SETTLE_MS    = 500;   
 
 // =============================================================================
 // HELPER: wait for robot state to settle after an execute() call
@@ -57,21 +52,17 @@ void waitForStateSettle(
     int ms = STATE_SETTLE_MS)
 {
     rclcpp::sleep_for(std::chrono::milliseconds(ms));
-    iface.startStateMonitor(1.0); // force a fresh state read
+    iface.startStateMonitor(1.0); 
 }
 
 // =============================================================================
-// HELPER: attempt a straight Cartesian move; fall back to OMPL if needed.
-//
-//   Returns true on success, false if both methods fail.
-//   The function temporarily switches planners as required and restores them.
+// HELPER: Strict Cartesian move for LIFT/DROP. NO OMPL FALLBACK.
 // =============================================================================
-bool cartesianMoveWithFallback(
+bool strictCartesianMove(
     moveit::planning_interface::MoveGroupInterface & iface,
     const geometry_msgs::msg::Pose                & target,
     const std::string                             & phase_name)
 {
-    // --- Try Cartesian path first ---
     std::vector<geometry_msgs::msg::Pose> waypoints = {target};
     moveit_msgs::msg::RobotTrajectory trajectory;
 
@@ -82,35 +73,16 @@ bool cartesianMoveWithFallback(
         std::cout << "    [" << phase_name << "] Cartesian path: "
                   << static_cast<int>(fraction * 100) << "% complete. Executing...\n";
         auto result = iface.execute(trajectory);
-        if (result == moveit::core::MoveItErrorCode::SUCCESS) {
-            return true;
-        }
-        std::cout << "    [" << phase_name << "] Cartesian execute failed. Falling back to OMPL...\n";
-    } else {
-        std::cout << "    [" << phase_name << "] Cartesian coverage too low ("
-                  << static_cast<int>(fraction * 100) << "%). Falling back to OMPL...\n";
-    }
-
-    // --- OMPL fallback ---
-    iface.setPlanningPipelineId("ompl");
-    iface.setPlannerId("RRTConnectkConfigDefault");
-    iface.setPlanningTime(5.0);
-
-    iface.setPoseTarget(target);
-    moveit::planning_interface::MoveGroupInterface::Plan plan;
-
-    if (iface.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-        std::cout << "    [" << phase_name << "] OMPL plan found. Executing...\n";
-        auto result = iface.execute(plan);
         return (result == moveit::core::MoveItErrorCode::SUCCESS);
-    }
-
-    std::cout << "[-] [" << phase_name << "] Both Cartesian and OMPL failed.\n";
+    } 
+    
+    std::cout << "[-] [" << phase_name << "] Cartesian coverage too low ("
+              << static_cast<int>(fraction * 100) << "%). Aborting to prevent spilling.\n";
     return false;
 }
 
 // =============================================================================
-// HELPER: find IK-valid overhead pose by scanning roll angles
+// HELPER: find IK-valid overhead pose by scanning YAW angles (Z-axis rotation)
 // =============================================================================
 bool findValidOverheadPose(
     moveit::planning_interface::MoveGroupInterface & iface,
@@ -122,17 +94,17 @@ bool findValidOverheadPose(
     const moveit::core::JointModelGroup * jmg =
         kinematic_state->getJointModelGroup("arm_group");
 
-    // Radial scan: try 0° first, then ±1°, ±2°, ..., ±180°
-    std::vector<int> roll_angles = {0};
-    for (int i = 1; i <= 180; ++i) {
-        roll_angles.push_back(i);
-        roll_angles.push_back(-i);
+    // Radial scan around Z (Yaw): keeps the tube perfectly upright!
+    std::vector<int> yaw_angles = {0};
+    for (int i = 1; i <= 180; i += 5) {
+        yaw_angles.push_back(i);
+        yaw_angles.push_back(-i);
     }
 
-    for (int angle : roll_angles) {
-        double roll = angle * (M_PI / 180.0);
+    for (int angle : yaw_angles) {
+        double yaw = angle * (M_PI / 180.0);
         tf2::Quaternion q_rot;
-        q_rot.setRotation(tf2::Vector3(1, 0, 0), roll);
+        q_rot.setRotation(tf2::Vector3(0, 0, 1), yaw); // Z-axis rotation
         tf2::Quaternion q_final = (q_upright * q_rot).normalized();
 
         geometry_msgs::msg::Pose test_pose;
@@ -146,7 +118,7 @@ bool findValidOverheadPose(
 
         if (kinematic_state->setFromIK(jmg, test_pose, 0.05)) {
             out_pose = test_pose;
-            std::cout << "    Found valid IK with roll=" << angle << " deg.\n";
+            std::cout << "    Found valid IK with yaw=" << angle << " deg.\n";
             return true;
         }
     }
@@ -158,9 +130,6 @@ bool findValidOverheadPose(
 // =============================================================================
 int main(int argc, char * argv[])
 {
-    // =========================================================================
-    // 1. SYSTEM INITIALIZATION
-    // =========================================================================
     rclcpp::init(argc, argv);
     auto node = std::make_shared<rclcpp::Node>("liquid_handler_master");
 
@@ -175,26 +144,20 @@ int main(int argc, char * argv[])
     tf2::Quaternion q_upright;
     q_upright.setRPY(0.0, -M_PI / 2.0, M_PI / 2.0);
 
-    // =========================================================================
-    // 2. INITIAL MOTION TO START POINT  (OMPL — no liquid yet)
-    // =========================================================================
     std::cout << "\n>>> [INIT] Moving to start position with OMPL...\n";
 
     arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_TRANSIT);
     arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_TRANSIT);
-
     arm_interface.setPlanningPipelineId("ompl");
     arm_interface.setPlannerId("RRTConnectkConfigDefault");
     arm_interface.setPlanningTime(5.0);
-
-    // Relaxed tolerances so OMPL finds a solution quickly
     arm_interface.setGoalPositionTolerance(0.01);
     arm_interface.setGoalOrientationTolerance(0.05);
 
     geometry_msgs::msg::Pose start_pose;
     start_pose.position.x    = -0.15;
     start_pose.position.y    = -0.15;
-    start_pose.position.z    =  0.20; // well above base to avoid self-collision
+    start_pose.position.z    =  0.20; 
     start_pose.orientation.x = q_upright.x();
     start_pose.orientation.y = q_upright.y();
     start_pose.orientation.z = q_upright.z();
@@ -214,13 +177,9 @@ int main(int argc, char * argv[])
         return -1;
     }
 
-    // Tighten tolerances for precision liquid handling
     arm_interface.setGoalPositionTolerance(0.001);
     arm_interface.setGoalOrientationTolerance(0.001);
 
-    // =========================================================================
-    // 3. INTERACTIVE LOOP  (LIFT → MOVE → DROP)
-    // =========================================================================
     std::cout << "\n>>> Ready. Enter targets as: X Y Z   (or 'q' to quit)\n";
 
     while (rclcpp::ok()) {
@@ -237,16 +196,13 @@ int main(int argc, char * argv[])
             continue;
         }
 
-        // Compute safe transit height — always well above the target
         double safe_z = SAFE_Z_DEFAULT;
         if (tz + SAFE_Z_MARGIN > safe_z) {
             safe_z = tz + SAFE_Z_MARGIN;
         }
 
         // =================================================================
-        // PHASE 1: LIFT  — straight up to safe_z
-        // Planner: Cartesian path (preferred) with OMPL fallback
-        // Speed:   transit (no liquid yet / liquid secured vertically)
+        // PHASE 1: LIFT  — straight up to safe_z (Strict Cartesian)
         // =================================================================
         std::cout << "\n--- [PHASE 1] LIFT to Z=" << safe_z << " ---\n";
 
@@ -258,15 +214,14 @@ int main(int argc, char * argv[])
 
         bool lifted = false;
 
-        // Retry with increasing Z if the straight-up path is blocked
         for (double z_try = safe_z;
              z_try <= safe_z + SAFE_Z_MAX_RETRY && !lifted;
              z_try += SAFE_Z_RETRY_STEP)
         {
             lift_pose.position.z = z_try;
 
-            if (cartesianMoveWithFallback(arm_interface, lift_pose, "LIFT")) {
-                safe_z = z_try; // remember the height that actually worked
+            if (strictCartesianMove(arm_interface, lift_pose, "LIFT")) {
+                safe_z = z_try; 
                 lifted = true;
                 waitForStateSettle(arm_interface);
             } else {
@@ -275,21 +230,18 @@ int main(int argc, char * argv[])
         }
 
         if (!lifted) {
-            std::cout << "[-] [PHASE 1] Cannot lift. Skipping this target.\n";
+            std::cout << "[-] [PHASE 1] Cannot lift securely. Skipping this target.\n";
             continue;
         }
 
         // =================================================================
         // PHASE 2: MOVE  — horizontal transfer at safe_z
-        // Planner: Pilz LIN (guarantees straight-line Cartesian motion)
-        // Speed:   slow (carrying liquid)
         // =================================================================
         std::cout << "\n--- [PHASE 2] HORIZONTAL MOVE to (" << tx << ", " << ty << ") ---\n";
 
         arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
         arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_LIQUID);
 
-        // Switch to Pilz LIN for guaranteed straight-line motion
         arm_interface.setPlanningPipelineId("pilz_industrial_motion_planner");
         arm_interface.setPlannerId("LIN");
         arm_interface.setPlanningTime(2.0);
@@ -312,12 +264,32 @@ int main(int argc, char * argv[])
         }
 
         if (!moved) {
-            // LIN failed: fall back to OMPL for the horizontal leg
-            std::cout << "    [PHASE 2] Pilz LIN failed. Falling back to OMPL...\n";
+            std::cout << "    [PHASE 2] Pilz LIN failed. Falling back to CONSTRAINED OMPL...\n";
+            
             arm_interface.setPlanningPipelineId("ompl");
             arm_interface.setPlannerId("RRTConnectkConfigDefault");
             arm_interface.setPlanningTime(5.0);
             arm_interface.setPoseTarget(overhead_pose);
+
+            // Create Path Constraint to prevent spilling during OMPL transit
+            moveit_msgs::msg::OrientationConstraint ocm;
+            ocm.link_name = arm_interface.getEndEffectorLink();
+            ocm.header.frame_id = arm_interface.getPlanningFrame();
+            
+            ocm.orientation.x = q_upright.x();
+            ocm.orientation.y = q_upright.y();
+            ocm.orientation.z = q_upright.z();
+            ocm.orientation.w = q_upright.w();
+            
+            // Allow ~3 degrees of tilt, but let yaw spin freely
+            ocm.absolute_x_axis_tolerance = 0.05; 
+            ocm.absolute_y_axis_tolerance = 0.05;
+            ocm.absolute_z_axis_tolerance = 3.14; 
+            ocm.weight = 1.0;
+
+            moveit_msgs::msg::Constraints path_constraints;
+            path_constraints.orientation_constraints.push_back(ocm);
+            arm_interface.setPathConstraints(path_constraints);
 
             MoveGroupInterface::Plan plan_ompl;
             if (arm_interface.plan(plan_ompl) == moveit::core::MoveItErrorCode::SUCCESS) {
@@ -326,6 +298,9 @@ int main(int argc, char * argv[])
                     waitForStateSettle(arm_interface);
                 }
             }
+            
+            // IMPORTANT: Clear constraints for the next loop
+            arm_interface.clearPathConstraints();
         }
 
         if (!moved) {
@@ -334,31 +309,24 @@ int main(int argc, char * argv[])
         }
 
         // =================================================================
-        // PHASE 3: DROP  — straight down to target Z
-        // Planner: Cartesian path (preferred) with OMPL fallback
-        // Speed:   slow (liquid in transit)
+        // PHASE 3: DROP  — straight down to target Z (Strict Cartesian)
         // =================================================================
         std::cout << "\n--- [PHASE 3] DROP to Z=" << tz << " ---\n";
 
         arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
         arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_LIQUID);
 
-        // Build the drop target from the current (settled) pose so X,Y,orientation
-        // exactly match what Phase 2 left us at — only Z changes.
         geometry_msgs::msg::Pose drop_pose = arm_interface.getCurrentPose().pose;
         drop_pose.position.z = tz;
 
-        if (cartesianMoveWithFallback(arm_interface, drop_pose, "DROP")) {
+        if (strictCartesianMove(arm_interface, drop_pose, "DROP")) {
             waitForStateSettle(arm_interface);
             std::cout << "\n>>> Sequence complete! Target reached safely.\n";
         } else {
-            std::cout << "[-] [PHASE 3] Cannot drop. Check for collisions or joint limits.\n";
+            std::cout << "[-] [PHASE 3] Cannot drop securely. Workspace obstructed.\n";
         }
     }
 
-    // =========================================================================
-    // 4. SHUTDOWN
-    // =========================================================================
     std::cout << "\n>>> Shutting down. Goodbye!\n";
     rclcpp::shutdown();
     spinner.join();
