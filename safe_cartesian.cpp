@@ -51,7 +51,7 @@ int main(int argc, char * argv[])
     // Αλλάζουμε λίγο το Z για να είμαστε σίγουροι ότι είναι μακριά από τη βάση (αποφυγή self-collision)
     start_pose.position.x = -0.15;
     start_pose.position.y = -0.15;
-    start_pose.position.z = 0.20; // Σηκώσαμε το Z στα 20cm 
+    start_pose.position.z = 0.15; // Σηκώσαμε το Z στα 20cm 
 
     // The universal "Upright" mathematical state
     tf2::Quaternion q_upright;
@@ -88,13 +88,16 @@ int main(int argc, char * argv[])
     arm_interface.setPlannerId("LIN"); // Γραμμική Κίνηση (Linear)
     arm_interface.setPlanningTime(2.0); 
 
+// =========================================================================
+    // 4. INTERACTIVE LOOP (LIFT - MOVE - DROP ARCHITECTURE)
     // =========================================================================
-    // 4. INTERACTIVE LOOP (LINEAR MOTION WITH SMART ROLL)
-    // =========================================================================
-    // Το q_upright είναι το "όρθιο" μαθηματικό state (X-axis vertical)
+
+    // Χαμηλές και σταθερές ταχύτητες για να προλαβαίνει ο καρπός να στρίψει
+    arm_interface.setMaxVelocityScalingFactor(0.05); 
+    arm_interface.setMaxAccelerationScalingFactor(0.05);
 
     while (rclcpp::ok()) {
-        std::cout << "\nEnter <X Y Z> : ";
+        std::cout << "\nEnter Final Target <X Y Z> : ";
         std::string line;
         std::getline(std::cin, line);
         if (line == "q" || line == "Q") break;
@@ -103,26 +106,49 @@ int main(int argc, char * argv[])
         double tx, ty, tz;
         if (!(ss >> tx >> ty >> tz)) continue;
 
-        std::cout << ">>> Calculating optimal minimal wrist Roll for target XYZ..." << std::endl;
+        double SAFE_Z = 0.33; // Το "ευέλικτο" ύψος που ανακαλύψαμε
+        if (tz > SAFE_Z) SAFE_Z = tz + 0.05; // Αν του ζητήσεις να πάει πιο ψηλά από το 0.30, αναπροσαρμόζεται
+
+        // ---------------------------------------------------------------------
+        // ΦΑΣΗ 1: LIFT (Κάθετη Ανύψωση)
+        // ---------------------------------------------------------------------
+        std::cout << "\n[PHASE 1] Lifting straight up to safe height (Z=" << SAFE_Z << ")..." << std::endl;
+        geometry_msgs::msg::Pose current_pose = arm_interface.getCurrentPose().pose;
+        geometry_msgs::msg::Pose lift_pose = current_pose;
+        lift_pose.position.z = SAFE_Z;
         
+        arm_interface.setPoseTarget(lift_pose);
+        moveit::planning_interface::MoveGroupInterface::Plan plan_lift;
+        
+        if (arm_interface.plan(plan_lift) == moveit::core::MoveItErrorCode::SUCCESS) {
+            arm_interface.execute(plan_lift);
+        } else {
+            std::cout << "[-] Phase 1 Failed: Cannot lift straight up (Limit reached?)" << std::endl;
+            continue; // Επιστροφή στην αναμονή νέου input
+        }
+
+        // ---------------------------------------------------------------------
+        // ΦΑΣΗ 2: MOVE (Οριζόντια Μεταφορά + Smart Roll)
+        // ---------------------------------------------------------------------
+        std::cout << "[PHASE 2] Moving horizontally. Calculating optimal Roll..." << std::endl;
+        
+        // Παίρνουμε το νέο state ΤΩΡΑ που είμαστε ψηλά
         moveit::core::RobotStatePtr kinematic_state = arm_interface.getCurrentState();
         const moveit::core::JointModelGroup* joint_model_group = kinematic_state->getJointModelGroup("arm_group");
         
         bool found_valid_target = false;
-        geometry_msgs::msg::Pose valid_target_pose;
+        geometry_msgs::msg::Pose overhead_pose;
 
-        // 1. Δημιουργούμε τη σωστή, ακτινωτή σειρά αναζήτησης (0, 10, -10, 20, -20...)
+        // Ακτινωτή αναζήτηση για την ελάχιστη δυνατή περιστροφή
         std::vector<int> roll_angles;
-        roll_angles.push_back(0); // Ξεκινάμε ΠΑΝΤΑ ζητώντας 0 μοίρες περιστροφής (χωρίς στρίψιμο)
-        for (int i = 10; i <= 180; i += 10) {
+        roll_angles.push_back(0); 
+        for (int i = 0; i <= 180; i += 1) {
             roll_angles.push_back(i);
             roll_angles.push_back(-i);
         }
 
-        // 2. Σαρώνουμε με βάση τη νέα σειρά
         for (int angle : roll_angles) {
             double roll = angle * (M_PI / 180.0);
-            
             tf2::Quaternion q_rot;
             q_rot.setRotation(tf2::Vector3(1, 0, 0), roll); 
             tf2::Quaternion q_final = q_upright * q_rot;
@@ -131,37 +157,52 @@ int main(int argc, char * argv[])
             geometry_msgs::msg::Pose test_pose;
             test_pose.position.x = tx;
             test_pose.position.y = ty;
-            test_pose.position.z = tz;
+            test_pose.position.z = SAFE_Z; // Παραμένουμε στο ασφαλές ύψος
             test_pose.orientation.x = q_final.x();
             test_pose.orientation.y = q_final.y();
             test_pose.orientation.z = q_final.z();
             test_pose.orientation.w = q_final.w();
 
-            // Ρωτάμε το IK
             if (kinematic_state->setFromIK(joint_model_group, test_pose, 0.05)) {
-                valid_target_pose = test_pose;
+                overhead_pose = test_pose;
                 found_valid_target = true;
-                std::cout << ">>> Found reachable target! Minimal Roll required: " << angle << " degrees." << std::endl;
-                break; // Βρήκαμε την πιο κοντινή στο 0 γωνία, σταματάμε!
+                std::cout << "          Found valid path! Minimal Roll required: " << angle << " degrees." << std::endl;
+                break; 
             }
         }
 
         if (!found_valid_target) {
-            std::cout << "[-] Target XYZ is completely out of reach (even with spinning wrist)." << std::endl;
+            std::cout << "[-] Phase 2 Failed: Target X,Y is out of reach even at safe height." << std::endl;
             continue;
         }
 
-        // Δίνουμε τη νέα στάση (με το στριμμένο Roll) στον Pilz
-        arm_interface.setPoseTarget(valid_target_pose);
-
-        std::cout << ">>> Planning Linear Motion with Pilz..." << std::endl;
-        MoveGroupInterface::Plan my_plan;
+        arm_interface.setPoseTarget(overhead_pose);
+        moveit::planning_interface::MoveGroupInterface::Plan plan_move;
         
-        if (arm_interface.plan(my_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-            std::cout << ">>> Linear path found! Executing smooth trajectory..." << std::endl;
-            arm_interface.execute(my_plan);
+        if (arm_interface.plan(plan_move) == moveit::core::MoveItErrorCode::SUCCESS) {
+            arm_interface.execute(plan_move);
         } else {
-            std::cout << "[-] Failed to find a linear path to the valid target." << std::endl;
+            std::cout << "[-] Phase 2 Failed: Could not draw a straight line to overhead target." << std::endl;
+            continue;
+        }
+
+        // ---------------------------------------------------------------------
+        // ΦΑΣΗ 3: DROP (Κάθετη Κάθοδος)
+        // ---------------------------------------------------------------------
+        std::cout << "[PHASE 3] Dropping straight down to final target (Z=" << tz << ")..." << std::endl;
+        
+        // Παίρνουμε την ΤΡΕΧΟΥΣΑ στάση (που έχει ήδη το σωστό X,Y και το σωστό Roll από τη Φάση 2)
+        geometry_msgs::msg::Pose drop_pose = arm_interface.getCurrentPose().pose; 
+        drop_pose.position.z = tz; // Το μόνο που αλλάζουμε είναι να κατέβουμε!
+
+        arm_interface.setPoseTarget(drop_pose);
+        moveit::planning_interface::MoveGroupInterface::Plan plan_drop;
+        
+        if (arm_interface.plan(plan_drop) == moveit::core::MoveItErrorCode::SUCCESS) {
+            arm_interface.execute(plan_drop);
+            std::cout << ">>> Sequence Complete! Glass delivered safely.\n" << std::endl;
+        } else {
+            std::cout << "[-] Phase 3 Failed: Cannot drop down (Collision or Limit)." << std::endl;
         }
     }
 
