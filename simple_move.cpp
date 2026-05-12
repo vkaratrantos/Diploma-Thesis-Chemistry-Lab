@@ -1,11 +1,7 @@
 // =============================================================================
 // simple_move.cpp — Liquid Handler Pick & Place
-// ROS 2 Humble | MoveIt 2 | Pilz Industrial Motion Planner
-//
-// Architecture: LIFT (Cartesian) → MOVE (Pilz/OMPL via points) → DROP (Cartesian)
 // =============================================================================
 
-// --- Standard C++ Libraries ---
 #include <memory>
 #include <thread>
 #include <iostream>
@@ -14,8 +10,6 @@
 #include <cmath>
 #include <vector>
 #include <chrono>
-
-// --- ROS 2 & MoveIt 2 Libraries ---
 #include <rclcpp/rclcpp.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
@@ -24,19 +18,15 @@
 #include <geometry_msgs/msg/pose.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 
-// =============================================================================
 // CONSTANTS
-// =============================================================================
+
 static constexpr double VEL_SCALE_TRANSIT  = 0.10; 
 static constexpr double VEL_SCALE_LIQUID   = 0.05; 
 static constexpr double ACC_SCALE_TRANSIT  = 0.10;
 static constexpr double ACC_SCALE_LIQUID   = 0.05;
-
 static constexpr double CARTESIAN_EEF_STEP = 0.005; 
 static constexpr double CARTESIAN_JUMP_THR = 0.0;   
-
 static constexpr double MIN_CARTESIAN_FRACTION = 0.95; 
-
 static constexpr double SAFE_Z_DEFAULT     = 0.3;  
 static constexpr double SAFE_Z_MARGIN      = 0.12;  
 static constexpr double SAFE_Z_RETRY_STEP  = 0.03;  
@@ -44,9 +34,7 @@ static constexpr double SAFE_Z_MAX_RETRY   = 0.15;
 
 static constexpr int    STATE_SETTLE_MS    = 500;   
 
-// =============================================================================
 // HELPER: wait for robot state to settle after an execute() call
-// =============================================================================
 void waitForStateSettle(
     moveit::planning_interface::MoveGroupInterface & iface,
     int ms = STATE_SETTLE_MS)
@@ -55,9 +43,7 @@ void waitForStateSettle(
     iface.startStateMonitor(1.0); 
 }
 
-// =============================================================================
 // HELPER: Strict Cartesian move for LIFT/DROP. NO OMPL FALLBACK.
-// =============================================================================
 bool strictCartesianMove(
     moveit::planning_interface::MoveGroupInterface & iface,
     const geometry_msgs::msg::Pose                & target,
@@ -81,9 +67,7 @@ bool strictCartesianMove(
     return false;
 }
 
-// =============================================================================
 // HELPER: find IK-valid overhead pose by scanning YAW angles (Z-axis rotation)
-// =============================================================================
 bool findValidOverheadPose(
     moveit::planning_interface::MoveGroupInterface & iface,
     double tx, double ty, double safe_z,
@@ -123,9 +107,7 @@ bool findValidOverheadPose(
     return false;
 }
 
-// =============================================================================
 // HELPER: Attempt a horizontal move keeping the tube upright (LIN -> OMPL)
-// =============================================================================
 bool horizontalTransitUpright(
     moveit::planning_interface::MoveGroupInterface & iface,
     const geometry_msgs::msg::Pose                 & target_pose,
@@ -175,14 +157,12 @@ bool horizontalTransitUpright(
         }
     }
     
-    iface.clearPathConstraints(); // Always clean up!
+    iface.clearPathConstraints();
     return success;
 }
 
 
-// =============================================================================
 // MAIN
-// =============================================================================
 int main(int argc, char * argv[])
 {
     rclcpp::init(argc, argv);
@@ -255,9 +235,7 @@ int main(int argc, char * argv[])
             safe_z = tz + SAFE_Z_MARGIN;
         }
 
-        // =================================================================
         // PHASE 1: LIFT  — straight up to safe_z (Strict Cartesian)
-        // =================================================================
         std::cout << "\n--- [PHASE 1] LIFT to Z=" << safe_z << " ---\n";
 
         arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
@@ -288,12 +266,10 @@ int main(int argc, char * argv[])
             continue;
         }
 
-        // =================================================================
         // PHASE 2: MOVE  — horizontal transfer at safe_z using strict Cartesian
-        // =================================================================
         std::cout << "\n--- [PHASE 2] HORIZONTAL MOVE to (" << tx << ", " << ty << ") ---\n";
 
-        bool moved = false; // <--- ADD THIS LINE RIGHT HERE
+        bool moved = false;
         
         // 1. Force hardware state sync
         arm_interface.setStartStateToCurrentState();
@@ -305,7 +281,7 @@ int main(int argc, char * argv[])
         // 2. Get current pose (already upright and at safe_z from Phase 1)
         geometry_msgs::msg::Pose horizontal_pose = arm_interface.getCurrentPose().pose;
         
-        // 3. Just change the X and Y
+        // 3. Change the X and Y
         horizontal_pose.position.x = tx;
         horizontal_pose.position.y = ty;
         
@@ -329,9 +305,7 @@ int main(int argc, char * argv[])
             continue;
         }
 
-        // =================================================================
         // PHASE 3: DROP  — straight down to target Z (Strict Cartesian)
-        // =================================================================
         std::cout << "\n--- [PHASE 3] DROP to Z=" << tz << " ---\n";
 
         arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
