@@ -164,6 +164,80 @@ bool horizontalTransitUpright(
     return success;
 }
 
+// HELPER: 2-Stage Smart Drop (Approach & Insert)
+bool smartVerticalDrop(
+    moveit::planning_interface::MoveGroupInterface & iface,
+    double target_z,
+    const tf2::Quaternion & q_upright)
+{
+    geometry_msgs::msg::Pose start_pose = iface.getCurrentPose().pose;
+    geometry_msgs::msg::Pose final_pose = start_pose;
+    final_pose.position.z = target_z;
+
+    // 1. Attempt Pure Cartesian (Best Case scenario)
+    if (strictCartesianMove(iface, final_pose, "DROP_DIRECT")) {
+        return true;
+    }
+
+    std::cout << "    [-] Direct drop blocked. Using 2-Stage Approach & Insert...\n";
+
+    // 2. Calculate Approach Pose (4 cm above target)
+    double approach_z = target_z + 0.04; 
+    if (start_pose.position.z <= approach_z) {
+        std::cout << "    [-] Arm is already too low for a 2-stage drop.\n";
+        return false;
+    }
+
+    geometry_msgs::msg::Pose approach_pose = start_pose;
+    approach_pose.position.z = approach_z;
+
+    // --- STAGE A: Constrained OMPL Descent ---
+    iface.setPlanningPipelineId("ompl");
+    iface.setPlannerId("RRTConnectkConfigDefault");
+    iface.setPlanningTime(10.0);
+    iface.setPoseTarget(approach_pose);
+
+    // Keep the tube upright, but allow the arm to figure out the easiest joint path
+    moveit_msgs::msg::OrientationConstraint ocm;
+    ocm.link_name = iface.getEndEffectorLink();
+    ocm.header.frame_id = iface.getPlanningFrame();
+    ocm.orientation.x = q_upright.x();
+    ocm.orientation.y = q_upright.y();
+    ocm.orientation.z = q_upright.z();
+    ocm.orientation.w = q_upright.w();
+    ocm.absolute_x_axis_tolerance = 0.15; 
+    ocm.absolute_y_axis_tolerance = 0.15;
+    ocm.absolute_z_axis_tolerance = 3.14; 
+    ocm.weight = 1.0;
+
+    moveit_msgs::msg::Constraints path_constraints;
+    path_constraints.orientation_constraints.push_back(ocm);
+    iface.setPathConstraints(path_constraints);
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    bool approach_success = false;
+    
+    if (iface.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+        if (iface.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+            waitForStateSettle(iface);
+            approach_success = true;
+        }
+    }
+    iface.clearPathConstraints();
+
+    if (!approach_success) {
+        std::cout << "    [-] Approach phase failed.\n";
+        return false;
+    }
+
+    // --- STAGE B: Strict Cartesian Insertion ---
+    std::cout << "    [+] Approach reached. Executing final vertical insertion...\n";
+    
+    // Sync the state and plunge the final 4cm perfectly straight
+    iface.setStartStateToCurrentState();
+    return strictCartesianMove(iface, final_pose, "DROP_INSERT");
+}
+
 // MAIN
 int main(int argc, char * argv[])
 {
@@ -344,7 +418,7 @@ int main(int argc, char * argv[])
             perp_x /= mag; perp_y /= mag;
 
             // Broader range of offsets for 7-DOF flexibility
-            std::vector<double> offsets = {0.02, -0.02, 0.05, -0.05, 0.08, -0.08, 0.12, -0.12};
+            std::vector<double> offsets = {0.01, -0.01, 0.02, -0.02, 0.03, -0.03, 0.04, -0.04, 0.05, -0.05, 0.06, -0.06, 0.07, -0.07, 0.08, -0.08, 0.09, -0.09, 0.1, -0.1, 0.11, -0.11, 0.12, -0.12, 0.13, -0.13, 0.14, -0.14, 0.15, -0.15, 0.16, -0.16, 0.17, -0.17, 0.18, -0.18, 0.19, -0.19, 0.2, -0.2, 0.21, -0.21, 0.22, -0.22, 0.23, -0.23};
 
             for (double offset : offsets) {
                 geometry_msgs::msg::Pose detour_pose = start_pose;
@@ -393,22 +467,20 @@ int main(int argc, char * argv[])
             continue;
         }
 
-        // PHASE 3: DROP  — straight down to target Z (Strict Cartesian)
+        // PHASE 3: DROP  — straight down to target Z
         std::cout << "\n--- [PHASE 3] DROP to Z=" << tz << " ---\n";
 
         arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
         arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_LIQUID);
 
-        geometry_msgs::msg::Pose drop_pose = arm_interface.getCurrentPose().pose;
         bool dropped = false;
 
         for (double z_try = tz;
              z_try <= tz + DROP_Z_MAX_RETRY && !dropped;
              z_try += DROP_Z_RETRY_STEP)
         {
-            drop_pose.position.z = z_try;
-
-            if (strictCartesianMove(arm_interface, drop_pose, "DROP")) {
+            // Use our new 2-stage drop function instead of basic Cartesian
+            if (smartVerticalDrop(arm_interface, z_try, q_upright)) {
                 dropped = true;
                 waitForStateSettle(arm_interface);
                 
