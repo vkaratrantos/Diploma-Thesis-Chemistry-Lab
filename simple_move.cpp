@@ -25,12 +25,15 @@ static constexpr double VEL_SCALE_LIQUID   = 0.05;
 static constexpr double ACC_SCALE_TRANSIT  = 0.10;
 static constexpr double ACC_SCALE_LIQUID   = 0.05;
 static constexpr double CARTESIAN_EEF_STEP = 0.005; 
-static constexpr double CARTESIAN_JUMP_THR = 0.0;   
+static constexpr double CARTESIAN_JUMP_THR = 2.0;   
 static constexpr double MIN_CARTESIAN_FRACTION = 0.95; 
-static constexpr double SAFE_Z_DEFAULT     = 0.3;  
-static constexpr double SAFE_Z_MARGIN      = 0.12;  
-static constexpr double SAFE_Z_RETRY_STEP  = 0.03;  
-static constexpr double SAFE_Z_MAX_RETRY   = 0.15;  
+
+// Fixed Standard Lift Height for 7-DOF myArm 300 Pi
+static constexpr double SAFE_Z_TARGET      = 0.28;  
+
+// Drop Retry Constants (Kept for Phase 3 safety)
+static constexpr double DROP_Z_RETRY_STEP  = 0.001;  
+static constexpr double DROP_Z_MAX_RETRY   = 0.05;  
 
 static constexpr int    STATE_SETTLE_MS    = 500;   
 
@@ -46,8 +49,8 @@ void waitForStateSettle(
 // HELPER: Strict Cartesian move for LIFT/DROP. NO OMPL FALLBACK.
 bool strictCartesianMove(
     moveit::planning_interface::MoveGroupInterface & iface,
-    const geometry_msgs::msg::Pose                & target,
-    const std::string                             & phase_name)
+    const geometry_msgs::msg::Pose                 & target,
+    const std::string                              & phase_name)
 {
     std::vector<geometry_msgs::msg::Pose> waypoints = {target};
     moveit_msgs::msg::RobotTrajectory trajectory;
@@ -161,7 +164,6 @@ bool horizontalTransitUpright(
     return success;
 }
 
-
 // MAIN
 int main(int argc, char * argv[])
 {
@@ -174,6 +176,7 @@ int main(int argc, char * argv[])
 
     using moveit::planning_interface::MoveGroupInterface;
     MoveGroupInterface arm_interface(node, "arm_group");
+    MoveGroupInterface gripper_interface(node, "gripper");
 
     tf2::Quaternion q_upright;
     q_upright.setRPY(0.0, -M_PI / 2.0, M_PI / 2.0);
@@ -217,91 +220,176 @@ int main(int argc, char * argv[])
     std::cout << "\n>>> Ready. Enter targets as: X Y Z   (or 'q' to quit)\n";
 
     while (rclcpp::ok()) {
-        std::cout << "\nEnter Final Target <X Y Z>: ";
+        std::cout << "\n[INPUT] Enter <X Y Z>, 'o' (Open), 'c' (Closed), 'p' (Pour) or 'q' (Quit): ";
         std::string line;
         std::getline(std::cin, line);
 
         if (line == "q" || line == "Q") break;
 
-        std::stringstream ss(line);
-        double tx, ty, tz;
-        if (!(ss >> tx >> ty >> tz)) {
-            std::cout << "[-] Invalid input. Please enter three numbers.\n";
+        // 1. Check for Gripper Commands
+        if (line == "o" || line == "O") {
+            std::cout << ">>> Opening Gripper...\n";
+            gripper_interface.setNamedTarget("open");
+            gripper_interface.move(); 
+            continue; 
+        }
+    
+        if (line == "c" || line == "C") {
+            std::cout << ">>> Closing Gripper...\n";
+            gripper_interface.setNamedTarget("closed");
+            gripper_interface.move();
+            continue;
+        }
+        
+
+        if (line == "c" || line == "C") {
+            std::cout << ">>> Closing Gripper...\n";
+            gripper_interface.setNamedTarget("closed");
+            gripper_interface.move();
             continue;
         }
 
-        double safe_z = SAFE_Z_DEFAULT;
-        if (tz + SAFE_Z_MARGIN > safe_z) {
-            safe_z = tz + SAFE_Z_MARGIN;
+        if (line == "p" || line == "P") {
+            std::cout << ">>> Pouring the liquid...\n";
+            
+            // 1. Get current joint positions
+            std::vector<double> joint_positions;
+            moveit::core::RobotStatePtr current_state = arm_interface.getCurrentState();
+            const moveit::core::JointModelGroup* joint_model_group = 
+                current_state->getJointModelGroup("arm_group");
+            current_state->copyJointGroupPositions(joint_model_group, joint_positions);
+
+            if (!joint_positions.empty()) {
+                double original_last_joint = joint_positions.back();
+                
+                // 2. Add 90 degrees (pi/2) to the last joint
+                joint_positions.back() = original_last_joint + (M_PI / 2.0);
+                arm_interface.setJointValueTarget(joint_positions);
+                
+                // 3. Execute the pour
+                if (arm_interface.move() == moveit::core::MoveItErrorCode::SUCCESS) {
+                    waitForStateSettle(arm_interface);
+                    std::cout << "    [+] Poured. Waiting 1 second...\n";
+                    
+                    // Wait for liquid to drain
+                    rclcpp::sleep_for(std::chrono::seconds(1));
+
+                    // 4. Return to the upright state
+                    std::cout << "    [+] Returning to upright...\n";
+                    joint_positions.back() = original_last_joint;
+                    arm_interface.setJointValueTarget(joint_positions);
+                    arm_interface.move();
+                    waitForStateSettle(arm_interface);
+                    
+                    std::cout << ">>> Pour sequence complete!\n";
+                } else {
+                    std::cout << "    [-] Could not execute pour. Joint limit reached?\n";
+                }
+            }
+            continue;
+        }
+        // ---> END POUR COMMAND <---
+        // 2. Parse as Coordinates
+        std::stringstream ss(line);
+        double tx, ty, tz;
+        if (!(ss >> tx >> ty >> tz)) {
+            std::cout << "[-] Invalid input. Use 'o', 'c', or three numbers.\n";
+            continue;
         }
 
-        // PHASE 1: LIFT  — straight up to safe_z (Strict Cartesian)
-        std::cout << "\n--- [PHASE 1] LIFT to Z=" << safe_z << " ---\n";
+        // PHASE 1: LIFT  — straight up to fixed SAFE_Z_TARGET
+        std::cout << "\n--- [PHASE 1] LIFT to Standard Z=" << SAFE_Z_TARGET << " ---\n";
 
         arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
         arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_LIQUID);
 
         geometry_msgs::msg::Pose current_pose = arm_interface.getCurrentPose().pose;
         geometry_msgs::msg::Pose lift_pose    = current_pose;
+        lift_pose.position.z = SAFE_Z_TARGET;
 
-        bool lifted = false;
-
-        for (double z_try = safe_z;
-             z_try <= safe_z + SAFE_Z_MAX_RETRY && !lifted;
-             z_try += SAFE_Z_RETRY_STEP)
-        {
-            lift_pose.position.z = z_try;
-
-            if (strictCartesianMove(arm_interface, lift_pose, "LIFT")) {
-                safe_z = z_try; 
-                lifted = true;
-                waitForStateSettle(arm_interface);
-            } else {
-                std::cout << "    Retrying with Z=" << (z_try + SAFE_Z_RETRY_STEP) << "...\n";
-            }
-        }
-
-        if (!lifted) {
-            std::cout << "[-] [PHASE 1] Cannot lift securely. Skipping this target.\n";
+        if (strictCartesianMove(arm_interface, lift_pose, "LIFT")) {
+            waitForStateSettle(arm_interface);
+        } else {
+            std::cout << "[-] [PHASE 1] Cannot reach standard lift height Z=" << SAFE_Z_TARGET 
+                      << ". Skipping this target.\n";
             continue;
         }
 
-        // PHASE 2: MOVE  — horizontal transfer at safe_z using strict Cartesian
+        // --- [PHASE 2] OPTIMIZED HORIZONTAL MOVE ---
         std::cout << "\n--- [PHASE 2] HORIZONTAL MOVE to (" << tx << ", " << ty << ") ---\n";
 
-        bool moved = false;
-        
-        // 1. Force hardware state sync
         arm_interface.setStartStateToCurrentState();
-        rclcpp::sleep_for(std::chrono::milliseconds(200));
+        geometry_msgs::msg::Pose start_pose = arm_interface.getCurrentPose().pose;
+        geometry_msgs::msg::Pose target_pose = start_pose;
+        target_pose.position.x = tx;
+        target_pose.position.y = ty;
 
-        arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
-        arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_LIQUID);
+        bool moved = false;
 
-        // 2. Get current pose (already upright and at safe_z from Phase 1)
-        geometry_msgs::msg::Pose horizontal_pose = arm_interface.getCurrentPose().pose;
-        
-        // 3. Change the X and Y
-        horizontal_pose.position.x = tx;
-        horizontal_pose.position.y = ty;
-        
-        // 4. Force orientation to be perfectly upright (overriding mechanical sag)
-        horizontal_pose.orientation.x = q_upright.x();
-        horizontal_pose.orientation.y = q_upright.y();
-        horizontal_pose.orientation.z = q_upright.z();
-        horizontal_pose.orientation.w = q_upright.w();
-
-        // 5. Execute using your existing Cartesian function
-        if (strictCartesianMove(arm_interface, horizontal_pose, "HORIZONTAL_MOVE")) {
+        // Try DIRECT path first
+        if (strictCartesianMove(arm_interface, target_pose, "HORIZ_DIRECT")) {
             waitForStateSettle(arm_interface);
             moved = true;
         } else {
-            std::cout << "[-] [PHASE 2] Cartesian horizontal move failed. Target may be out of reach.\n";
-            moved = false;
+            std::cout << "    [-] Direct path blocked. Running Virtual Look-Ahead for detours...\n";
+
+            // Geometry for Detour Calculation
+            double dx = tx - start_pose.position.x;
+            double dy = ty - start_pose.position.y;
+            double mid_x = start_pose.position.x + (dx / 2.0);
+            double mid_y = start_pose.position.y + (dy / 2.0);
+            double perp_x = -dy; 
+            double perp_y = dx;
+            double mag = std::sqrt(perp_x * perp_x + perp_y * perp_y);
+            perp_x /= mag; perp_y /= mag;
+
+            // Broader range of offsets for 7-DOF flexibility
+            std::vector<double> offsets = {0.02, -0.02, 0.05, -0.05, 0.08, -0.08, 0.12, -0.12};
+
+            for (double offset : offsets) {
+                geometry_msgs::msg::Pose detour_pose = start_pose;
+                detour_pose.position.x = mid_x + (perp_x * offset);
+                detour_pose.position.y = mid_y + (perp_y * offset);
+
+                // VIRTUAL CHECK LEG 1 (A -> C)
+                moveit_msgs::msg::RobotTrajectory traj1;
+                std::vector<geometry_msgs::msg::Pose> way1 = {detour_pose};
+                double frac1 = arm_interface.computeCartesianPath(way1, CARTESIAN_EEF_STEP, CARTESIAN_JUMP_THR, traj1);
+
+                if (frac1 >= MIN_CARTESIAN_FRACTION) {
+                    // VIRTUAL CHECK LEG 2 (C -> B)
+                    // We simulate the robot state at the end of Leg 1
+                    moveit::core::RobotState temp_state(*arm_interface.getCurrentState());
+                    temp_state.setJointGroupPositions("arm_group", traj1.joint_trajectory.points.back().positions);
+                    
+                    arm_interface.setStartState(temp_state); 
+                    moveit_msgs::msg::RobotTrajectory traj2;
+                    std::vector<geometry_msgs::msg::Pose> way2 = {target_pose};
+                    double frac2 = arm_interface.computeCartesianPath(way2, CARTESIAN_EEF_STEP, CARTESIAN_JUMP_THR, traj2);
+
+                    if (frac2 >= MIN_CARTESIAN_FRACTION) {
+                        std::cout << "    [+] Valid Detour Found (Offset: " << offset*100 << "cm). Executing Leg 1...\n";
+                        
+                        // Execute Leg 1
+                        arm_interface.setStartStateToCurrentState(); // Reset to reality for execution
+                        arm_interface.execute(traj1);
+                        waitForStateSettle(arm_interface);
+
+                        std::cout << "    [+] Executing Leg 2...\n";
+                        arm_interface.execute(traj2);
+                        waitForStateSettle(arm_interface);
+                        
+                        moved = true;
+                        break;
+                    }
+                }
+                // Reset start state for next iteration trial
+                arm_interface.setStartStateToCurrentState();
+            }
         }
 
         if (!moved) {
-            std::cout << "[-] [PHASE 2] Skipping to next target.\n";
+            std::cout << "[-] [PHASE 2] All detour attempts failed. Target unreachable upright.\n";
             continue;
         }
 
@@ -312,13 +400,30 @@ int main(int argc, char * argv[])
         arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_LIQUID);
 
         geometry_msgs::msg::Pose drop_pose = arm_interface.getCurrentPose().pose;
-        drop_pose.position.z = tz;
+        bool dropped = false;
 
-        if (strictCartesianMove(arm_interface, drop_pose, "DROP")) {
-            waitForStateSettle(arm_interface);
-            std::cout << "\n>>> Sequence complete! Target reached safely.\n";
-        } else {
-            std::cout << "[-] [PHASE 3] Cannot drop securely. Workspace obstructed.\n";
+        for (double z_try = tz;
+             z_try <= tz + DROP_Z_MAX_RETRY && !dropped;
+             z_try += DROP_Z_RETRY_STEP)
+        {
+            drop_pose.position.z = z_try;
+
+            if (strictCartesianMove(arm_interface, drop_pose, "DROP")) {
+                dropped = true;
+                waitForStateSettle(arm_interface);
+                
+                if (z_try == tz) {
+                    std::cout << "\n>>> Sequence complete! Target reached safely at exact Z=" << z_try << ".\n";
+                } else {
+                    std::cout << "\n>>> Sequence complete! Target reached safely, but slightly higher at Z=" << z_try << ".\n";
+                }
+            } else {
+                std::cout << "    Retrying DROP at a higher Z=" << (z_try + DROP_Z_RETRY_STEP) << "...\n";
+            }
+        }
+
+        if (!dropped) {
+            std::cout << "[-] [PHASE 3] Cannot drop securely. Workspace obstructed or kinematic limits reached.\n";
         }
     }
 
