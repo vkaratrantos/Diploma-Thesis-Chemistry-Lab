@@ -143,9 +143,9 @@ bool horizontalTransitUpright(
     ocm.orientation.y = q_upright.y();
     ocm.orientation.z = q_upright.z();
     ocm.orientation.w = q_upright.w();
-    ocm.absolute_x_axis_tolerance = 0.15; 
-    ocm.absolute_y_axis_tolerance = 0.15;
-    ocm.absolute_z_axis_tolerance = 3.14; 
+    ocm.absolute_x_axis_tolerance = 0.1; 
+    ocm.absolute_y_axis_tolerance = 0.1;
+    ocm.absolute_z_axis_tolerance = 0.1; 
     ocm.weight = 1.0;
 
     moveit_msgs::msg::Constraints path_constraints;
@@ -182,7 +182,7 @@ bool smartVerticalDrop(
     std::cout << "    [-] Direct drop blocked. Using 2-Stage Approach & Insert...\n";
 
     // 2. Calculate Approach Pose (4 cm above target)
-    double approach_z = target_z + 0.04; 
+    double approach_z = target_z + 0.05; 
     if (start_pose.position.z <= approach_z) {
         std::cout << "    [-] Arm is already too low for a 2-stage drop.\n";
         return false;
@@ -197,7 +197,7 @@ bool smartVerticalDrop(
     iface.setPlanningTime(10.0);
     iface.setPoseTarget(approach_pose);
 
-    // Keep the tube upright, but allow the arm to figure out the easiest joint path
+    // Keep the tube rigidly aligned to the specified RPY constraints
     moveit_msgs::msg::OrientationConstraint ocm;
     ocm.link_name = iface.getEndEffectorLink();
     ocm.header.frame_id = iface.getPlanningFrame();
@@ -205,8 +205,10 @@ bool smartVerticalDrop(
     ocm.orientation.y = q_upright.y();
     ocm.orientation.z = q_upright.z();
     ocm.orientation.w = q_upright.w();
-    ocm.absolute_x_axis_tolerance = 0.15; 
-    ocm.absolute_y_axis_tolerance = 0.15;
+    
+    // STRICT tolerances to enforce precise RPY during OMPL planning
+    ocm.absolute_x_axis_tolerance = 3.14; 
+    ocm.absolute_y_axis_tolerance = 3.14;
     ocm.absolute_z_axis_tolerance = 3.14; 
     ocm.weight = 1.0;
 
@@ -236,6 +238,89 @@ bool smartVerticalDrop(
     // Sync the state and plunge the final 4cm perfectly straight
     iface.setStartStateToCurrentState();
     return strictCartesianMove(iface, final_pose, "DROP_INSERT");
+}
+
+// HELPER: 2-Stage Smart Lift (Extraction & Ascent)
+bool smartVerticalLift(
+    moveit::planning_interface::MoveGroupInterface & iface,
+    double safe_z_target,
+    const tf2::Quaternion & q_upright)
+{
+    geometry_msgs::msg::Pose start_pose = iface.getCurrentPose().pose;
+    geometry_msgs::msg::Pose final_pose = start_pose;
+    final_pose.position.z = safe_z_target;
+
+    if (start_pose.position.z >= safe_z_target) return true;
+
+    // 1. Attempt Pure Cartesian (Best Case scenario)
+    if (strictCartesianMove(iface, final_pose, "LIFT_DIRECT")) {
+        return true;
+    }
+
+    std::cout << "    [-] Direct lift blocked. Using 2-Stage Extraction & Ascent...\n";
+
+    // 2. STAGE A: Calculate Extraction Pose (5 cm strictly upwards)
+    double extraction_z = start_pose.position.z + 0.05; 
+    if (extraction_z >= safe_z_target) {
+        // If 5cm puts us past the target and direct failed, abort.
+        return false;
+    }
+
+    geometry_msgs::msg::Pose extraction_pose = start_pose;
+    extraction_pose.position.z = extraction_z;
+
+    // Strict Cartesian pull to clear the case/rack
+    if (!strictCartesianMove(iface, extraction_pose, "LIFT_EXTRACT")) {
+        std::cout << "    [-] Extraction phase failed. Cannot clear the immediate area strictly.\n";
+        return false;
+    }
+
+    // 3. STAGE B: Constrained OMPL Ascent to final height
+    std::cout << "    [+] Extraction reached. Executing final constrained ascent...\n";
+    
+    // Sync the state after the extraction move
+    iface.setStartStateToCurrentState();
+    
+    iface.setPlanningPipelineId("ompl");
+    iface.setPlannerId("RRTConnectkConfigDefault");
+    iface.setPlanningTime(10.0);
+    iface.setPoseTarget(final_pose);
+
+    // Keep the tube rigidly aligned to the specified RPY constraints
+    moveit_msgs::msg::OrientationConstraint ocm;
+    ocm.link_name = iface.getEndEffectorLink();
+    ocm.header.frame_id = iface.getPlanningFrame();
+    ocm.orientation.x = q_upright.x();
+    ocm.orientation.y = q_upright.y();
+    ocm.orientation.z = q_upright.z();
+    ocm.orientation.w = q_upright.w();
+    
+    // STRICT tolerances to enforce precise RPY during OMPL planning
+    ocm.absolute_x_axis_tolerance = 0.3; 
+    ocm.absolute_y_axis_tolerance = 0.3;
+    ocm.absolute_z_axis_tolerance = 3.14; 
+    ocm.weight = 1.0;
+
+    moveit_msgs::msg::Constraints path_constraints;
+    path_constraints.orientation_constraints.push_back(ocm);
+    iface.setPathConstraints(path_constraints);
+
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    bool ascent_success = false;
+    
+    if (iface.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+        if (iface.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+            waitForStateSettle(iface);
+            ascent_success = true;
+        }
+    }
+    iface.clearPathConstraints();
+
+    if (!ascent_success) {
+        std::cout << "    [-] Ascent phase failed.\n";
+    }
+
+    return ascent_success;
 }
 
 // MAIN
@@ -314,14 +399,6 @@ int main(int argc, char * argv[])
             gripper_interface.move();
             continue;
         }
-        
-
-        if (line == "c" || line == "C") {
-            std::cout << ">>> Closing Gripper...\n";
-            gripper_interface.setNamedTarget("closed");
-            gripper_interface.move();
-            continue;
-        }
 
         if (line == "p" || line == "P") {
             std::cout << ">>> Pouring the liquid...\n";
@@ -362,26 +439,22 @@ int main(int argc, char * argv[])
             }
             continue;
         }
-        // ---> END POUR COMMAND <---
+
         // 2. Parse as Coordinates
         std::stringstream ss(line);
         double tx, ty, tz;
         if (!(ss >> tx >> ty >> tz)) {
-            std::cout << "[-] Invalid input. Use 'o', 'c', or three numbers.\n";
+            std::cout << "[-] Invalid input. Use 'o', 'c', 'p', or three numbers.\n";
             continue;
         }
 
-        // PHASE 1: LIFT  — straight up to fixed SAFE_Z_TARGET
+// PHASE 1: LIFT  — 2-Stage Smart Lift to fixed SAFE_Z_TARGET
         std::cout << "\n--- [PHASE 1] LIFT to Standard Z=" << SAFE_Z_TARGET << " ---\n";
 
         arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
         arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_LIQUID);
 
-        geometry_msgs::msg::Pose current_pose = arm_interface.getCurrentPose().pose;
-        geometry_msgs::msg::Pose lift_pose    = current_pose;
-        lift_pose.position.z = SAFE_Z_TARGET;
-
-        if (strictCartesianMove(arm_interface, lift_pose, "LIFT")) {
+        if (smartVerticalLift(arm_interface, SAFE_Z_TARGET, q_upright)) {
             waitForStateSettle(arm_interface);
         } else {
             std::cout << "[-] [PHASE 1] Cannot reach standard lift height Z=" << SAFE_Z_TARGET 
