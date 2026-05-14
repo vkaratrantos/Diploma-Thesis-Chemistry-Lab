@@ -17,6 +17,9 @@
 #include <moveit_msgs/msg/orientation_constraint.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <tf2/LinearMath/Quaternion.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit_msgs/msg/collision_object.hpp>
+#include <shape_msgs/msg/solid_primitive.hpp>
 
 // CONSTANTS
 
@@ -34,8 +37,58 @@ static constexpr double SAFE_Z_TARGET      = 0.28;
 // Drop Retry Constants (Kept for Phase 3 safety)
 static constexpr double DROP_Z_RETRY_STEP  = 0.001;  
 static constexpr double DROP_Z_MAX_RETRY   = 0.05;  
-
 static constexpr int    STATE_SETTLE_MS    = 500;   
+
+// --- NEW HELPER: Setup Environment Collisions ---
+void setupCollisionObjects(const std::string& frame_id) {
+    moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
+    std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
+
+    // 1. Table/Base Collision (3cm under base)
+    // Assuming a standard 1m x 1m table. Thickness = 2cm.
+    // To put the *top* of this 2cm table exactly 3cm below the robot base, 
+    // the center must be at Z = -0.03 (top) - 0.01 (half thickness) = -0.04m
+    moveit_msgs::msg::CollisionObject table;
+    table.id = "table_base";
+    table.header.frame_id = frame_id;
+    table.primitives.resize(1);
+    table.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
+    table.primitives[0].dimensions = {1.0, 1.0, 0.02}; // L x W x H
+    table.primitive_poses.resize(1);
+    table.primitive_poses[0].position.x = 0.0;
+    table.primitive_poses[0].position.y = 0.0;
+    table.primitive_poses[0].position.z = -0.02; 
+    table.primitive_poses[0].orientation.w = 1.0;
+    table.operation = table.ADD;
+    collision_objects.push_back(table);
+
+    // 2. Obstacle Box (X=[5, 10], Y=[-0.20, 0.20], Z=[0, 0.2])
+    moveit_msgs::msg::CollisionObject wall;
+    wall.id = "obstacle_box";
+    wall.header.frame_id = frame_id;
+    wall.primitives.resize(1);
+    wall.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
+    
+    // Size = Max - Min
+    wall.primitives[0].dimensions = {
+        0.4 - (-0.4),        // X width = 5.0m
+        0.20 - 0,    // Y width = 0.40m
+        0.05 - 0.0          // Z height = 0.2m
+    };
+    
+    // Center = Min + (Size / 2)
+    wall.primitive_poses.resize(1);
+    wall.primitive_poses[0].position.x = 0.0;
+    wall.primitive_poses[0].position.y = 0.18;
+    wall.primitive_poses[0].position.z = 0.00;   
+    wall.primitive_poses[0].orientation.w = 1.0;
+    wall.operation = wall.ADD;
+    collision_objects.push_back(wall);
+
+    // Apply to MoveIt
+    planning_scene_interface.applyCollisionObjects(collision_objects);
+    std::cout << ">>> [INIT] Collision objects loaded into scene.\n";
+}
 
 // HELPER: wait for robot state to settle after an execute() call
 void waitForStateSettle(
@@ -143,9 +196,9 @@ bool horizontalTransitUpright(
     ocm.orientation.y = q_upright.y();
     ocm.orientation.z = q_upright.z();
     ocm.orientation.w = q_upright.w();
-    ocm.absolute_x_axis_tolerance = 0.1; 
-    ocm.absolute_y_axis_tolerance = 0.1;
-    ocm.absolute_z_axis_tolerance = 0.1; 
+    ocm.absolute_x_axis_tolerance = 3.14; 
+    ocm.absolute_y_axis_tolerance = 0.2;
+    ocm.absolute_z_axis_tolerance = 0.2; 
     ocm.weight = 1.0;
 
     moveit_msgs::msg::Constraints path_constraints;
@@ -181,7 +234,7 @@ bool smartVerticalDrop(
 
     std::cout << "    [-] Direct drop blocked. Using 2-Stage Approach & Insert...\n";
 
-    // 2. Calculate Approach Pose (4 cm above target)
+    // 2. Calculate Approach Pose (5 cm above target)
     double approach_z = target_z + 0.05; 
     if (start_pose.position.z <= approach_z) {
         std::cout << "    [-] Arm is already too low for a 2-stage drop.\n";
@@ -208,8 +261,8 @@ bool smartVerticalDrop(
     
     // STRICT tolerances to enforce precise RPY during OMPL planning
     ocm.absolute_x_axis_tolerance = 3.14; 
-    ocm.absolute_y_axis_tolerance = 3.14;
-    ocm.absolute_z_axis_tolerance = 3.14; 
+    ocm.absolute_y_axis_tolerance = 0.2;
+    ocm.absolute_z_axis_tolerance = 0.2; 
     ocm.weight = 1.0;
 
     moveit_msgs::msg::Constraints path_constraints;
@@ -296,9 +349,9 @@ bool smartVerticalLift(
     ocm.orientation.w = q_upright.w();
     
     // STRICT tolerances to enforce precise RPY during OMPL planning
-    ocm.absolute_x_axis_tolerance = 0.3; 
-    ocm.absolute_y_axis_tolerance = 0.3;
-    ocm.absolute_z_axis_tolerance = 3.14; 
+    ocm.absolute_x_axis_tolerance = 3.14; 
+    ocm.absolute_y_axis_tolerance = 0.2;
+    ocm.absolute_z_axis_tolerance = 0.2; 
     ocm.weight = 1.0;
 
     moveit_msgs::msg::Constraints path_constraints;
@@ -336,6 +389,8 @@ int main(int argc, char * argv[])
     using moveit::planning_interface::MoveGroupInterface;
     MoveGroupInterface arm_interface(node, "arm_group");
     MoveGroupInterface gripper_interface(node, "gripper");
+    rclcpp::sleep_for(std::chrono::seconds(1));
+    setupCollisionObjects(arm_interface.getPlanningFrame());
 
     tf2::Quaternion q_upright;
     q_upright.setRPY(0.0, -M_PI / 2.0, M_PI / 2.0);
@@ -448,7 +503,7 @@ int main(int argc, char * argv[])
             continue;
         }
 
-// PHASE 1: LIFT  — 2-Stage Smart Lift to fixed SAFE_Z_TARGET
+        // PHASE 1: LIFT  — 2-Stage Smart Lift to fixed SAFE_Z_TARGET
         std::cout << "\n--- [PHASE 1] LIFT to Standard Z=" << SAFE_Z_TARGET << " ---\n";
 
         arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
@@ -536,10 +591,48 @@ int main(int argc, char * argv[])
         }
 
         if (!moved) {
-            std::cout << "[-] [PHASE 2] All detour attempts failed. Target unreachable upright.\n";
-            continue;
+            std::cout << "    [-] Cartesian detours failed. Attempting constrained OMPL fallback...\n";
+            arm_interface.setStartStateToCurrentState();
+            
+            arm_interface.setPlanningPipelineId("ompl");
+            arm_interface.setPlannerId("RRTConnectkConfigDefault");
+            arm_interface.setPlanningTime(15.0);
+            arm_interface.setPoseTarget(target_pose);
+
+            moveit_msgs::msg::OrientationConstraint ocm;
+            ocm.link_name = arm_interface.getEndEffectorLink();
+            ocm.header.frame_id = arm_interface.getPlanningFrame();
+            ocm.orientation.x = q_upright.x();
+            ocm.orientation.y = q_upright.y();
+            ocm.orientation.z = q_upright.z();
+            ocm.orientation.w = q_upright.w();
+            
+            // Your corrected tolerances!
+            ocm.absolute_x_axis_tolerance = 3.14; 
+            ocm.absolute_y_axis_tolerance = 0.2;
+            ocm.absolute_z_axis_tolerance = 0.2; 
+            ocm.weight = 1.0;
+
+            moveit_msgs::msg::Constraints path_constraints;
+            path_constraints.orientation_constraints.push_back(ocm);
+            arm_interface.setPathConstraints(path_constraints);
+
+            moveit::planning_interface::MoveGroupInterface::Plan plan;
+            if (arm_interface.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                if (arm_interface.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                    waitForStateSettle(arm_interface);
+                    moved = true;
+                    std::cout << "    [+] OMPL horizontal transit successful.\n";
+                }
+            }
+            arm_interface.clearPathConstraints();
         }
 
+        if (!moved) {
+            std::cout << "[-] [PHASE 2] All horizontal attempts failed. Target unreachable upright.\n";
+            continue;
+        }
+        
         // PHASE 3: DROP  — straight down to target Z
         std::cout << "\n--- [PHASE 3] DROP to Z=" << tz << " ---\n";
 
