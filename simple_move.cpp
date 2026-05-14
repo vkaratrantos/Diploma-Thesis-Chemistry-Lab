@@ -32,6 +32,7 @@ static constexpr double CARTESIAN_JUMP_THR = 2.0;
 static constexpr double MIN_CARTESIAN_FRACTION = 0.95; 
 
 // Fixed Standard Lift Height for 7-DOF myArm 300 Pi
+
 static constexpr double SAFE_Z_TARGET      = 0.28;  
 
 // Drop Retry Constants (Kept for Phase 3 safety)
@@ -40,14 +41,13 @@ static constexpr double DROP_Z_MAX_RETRY   = 0.05;
 static constexpr int    STATE_SETTLE_MS    = 500;   
 
 // --- NEW HELPER: Setup Environment Collisions ---
+
 void setupCollisionObjects(const std::string& frame_id) {
     moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
     std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
 
-    // 1. Table/Base Collision (3cm under base)
-    // Assuming a standard 1m x 1m table. Thickness = 2cm.
-    // To put the *top* of this 2cm table exactly 3cm below the robot base, 
-    // the center must be at Z = -0.03 (top) - 0.01 (half thickness) = -0.04m
+    // 1. Table/Base Collision
+
     moveit_msgs::msg::CollisionObject table;
     table.id = "table_base";
     table.header.frame_id = frame_id;
@@ -62,21 +62,20 @@ void setupCollisionObjects(const std::string& frame_id) {
     table.operation = table.ADD;
     collision_objects.push_back(table);
 
-    // 2. Obstacle Box (X=[5, 10], Y=[-0.20, 0.20], Z=[0, 0.2])
+    // 2. Obstacle Box
+    
     moveit_msgs::msg::CollisionObject wall;
     wall.id = "obstacle_box";
     wall.header.frame_id = frame_id;
     wall.primitives.resize(1);
     wall.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
     
-    // Size = Max - Min
     wall.primitives[0].dimensions = {
-        0.4 - (-0.4),        // X width = 5.0m
-        0.20 - 0,    // Y width = 0.40m
-        0.05 - 0.0          // Z height = 0.2m
+        0.4 - (-0.4),        
+        0.20 - 0,
+        0.05 - 0.0
     };
     
-    // Center = Min + (Size / 2)
     wall.primitive_poses.resize(1);
     wall.primitive_poses[0].position.x = 0.0;
     wall.primitive_poses[0].position.y = 0.18;
@@ -84,13 +83,10 @@ void setupCollisionObjects(const std::string& frame_id) {
     wall.primitive_poses[0].orientation.w = 1.0;
     wall.operation = wall.ADD;
     collision_objects.push_back(wall);
-
-    // Apply to MoveIt
     planning_scene_interface.applyCollisionObjects(collision_objects);
     std::cout << ">>> [INIT] Collision objects loaded into scene.\n";
 }
 
-// HELPER: wait for robot state to settle after an execute() call
 void waitForStateSettle(
     moveit::planning_interface::MoveGroupInterface & iface,
     int ms = STATE_SETTLE_MS)
@@ -99,7 +95,6 @@ void waitForStateSettle(
     iface.startStateMonitor(1.0); 
 }
 
-// HELPER: Strict Cartesian move for LIFT/DROP. NO OMPL FALLBACK.
 bool strictCartesianMove(
     moveit::planning_interface::MoveGroupInterface & iface,
     const geometry_msgs::msg::Pose                 & target,
@@ -123,7 +118,8 @@ bool strictCartesianMove(
     return false;
 }
 
-// HELPER: find IK-valid overhead pose by scanning YAW angles (Z-axis rotation)
+// Find IK-valid overhead pose by scanning YAW angles (Z-axis rotation)
+
 bool findValidOverheadPose(
     moveit::planning_interface::MoveGroupInterface & iface,
     double tx, double ty, double safe_z,
@@ -218,6 +214,7 @@ bool horizontalTransitUpright(
 }
 
 // HELPER: 2-Stage Smart Drop (Approach & Insert)
+
 bool smartVerticalDrop(
     moveit::planning_interface::MoveGroupInterface & iface,
     double target_z,
@@ -227,14 +224,15 @@ bool smartVerticalDrop(
     geometry_msgs::msg::Pose final_pose = start_pose;
     final_pose.position.z = target_z;
 
-    // 1. Attempt Pure Cartesian (Best Case scenario)
+    // 1. Attempt Cartesian
+    
     if (strictCartesianMove(iface, final_pose, "DROP_DIRECT")) {
         return true;
     }
 
     std::cout << "    [-] Direct drop blocked. Using 2-Stage Approach & Insert...\n";
 
-    // 2. Calculate Approach Pose (5 cm above target)
+    // 2. Calculate Approach Pose
     double approach_z = target_z + 0.05; 
     if (start_pose.position.z <= approach_z) {
         std::cout << "    [-] Arm is already too low for a 2-stage drop.\n";
@@ -245,12 +243,14 @@ bool smartVerticalDrop(
     approach_pose.position.z = approach_z;
 
     // --- STAGE A: Constrained OMPL Descent ---
+    
     iface.setPlanningPipelineId("ompl");
     iface.setPlannerId("RRTConnectkConfigDefault");
     iface.setPlanningTime(10.0);
     iface.setPoseTarget(approach_pose);
 
     // Keep the tube rigidly aligned to the specified RPY constraints
+    
     moveit_msgs::msg::OrientationConstraint ocm;
     ocm.link_name = iface.getEndEffectorLink();
     ocm.header.frame_id = iface.getPlanningFrame();
@@ -260,6 +260,7 @@ bool smartVerticalDrop(
     ocm.orientation.w = q_upright.w();
     
     // STRICT tolerances to enforce precise RPY during OMPL planning
+    
     ocm.absolute_x_axis_tolerance = 3.14; 
     ocm.absolute_y_axis_tolerance = 0.2;
     ocm.absolute_z_axis_tolerance = 0.2; 
@@ -286,14 +287,17 @@ bool smartVerticalDrop(
     }
 
     // --- STAGE B: Strict Cartesian Insertion ---
+    
     std::cout << "    [+] Approach reached. Executing final vertical insertion...\n";
     
     // Sync the state and plunge the final 4cm perfectly straight
+    
     iface.setStartStateToCurrentState();
     return strictCartesianMove(iface, final_pose, "DROP_INSERT");
 }
 
-// HELPER: 2-Stage Smart Lift (Extraction & Ascent)
+// 2-Stage Smart Lift (Extraction & Ascent)
+
 bool smartVerticalLift(
     moveit::planning_interface::MoveGroupInterface & iface,
     double safe_z_target,
@@ -305,14 +309,16 @@ bool smartVerticalLift(
 
     if (start_pose.position.z >= safe_z_target) return true;
 
-    // 1. Attempt Pure Cartesian (Best Case scenario)
+    // Pure Cartesian
+    
     if (strictCartesianMove(iface, final_pose, "LIFT_DIRECT")) {
         return true;
     }
 
     std::cout << "    [-] Direct lift blocked. Using 2-Stage Extraction & Ascent...\n";
 
-    // 2. STAGE A: Calculate Extraction Pose (5 cm strictly upwards)
+    // Calculate Extraction Pose
+    
     double extraction_z = start_pose.position.z + 0.05; 
     if (extraction_z >= safe_z_target) {
         // If 5cm puts us past the target and direct failed, abort.
@@ -322,16 +328,19 @@ bool smartVerticalLift(
     geometry_msgs::msg::Pose extraction_pose = start_pose;
     extraction_pose.position.z = extraction_z;
 
-    // Strict Cartesian pull to clear the case/rack
+    // Strict Cartesian pull to clear the rack
+    
     if (!strictCartesianMove(iface, extraction_pose, "LIFT_EXTRACT")) {
         std::cout << "    [-] Extraction phase failed. Cannot clear the immediate area strictly.\n";
         return false;
     }
 
     // 3. STAGE B: Constrained OMPL Ascent to final height
+    
     std::cout << "    [+] Extraction reached. Executing final constrained ascent...\n";
     
     // Sync the state after the extraction move
+    
     iface.setStartStateToCurrentState();
     
     iface.setPlanningPipelineId("ompl");
@@ -340,6 +349,7 @@ bool smartVerticalLift(
     iface.setPoseTarget(final_pose);
 
     // Keep the tube rigidly aligned to the specified RPY constraints
+    
     moveit_msgs::msg::OrientationConstraint ocm;
     ocm.link_name = iface.getEndEffectorLink();
     ocm.header.frame_id = iface.getPlanningFrame();
@@ -349,6 +359,7 @@ bool smartVerticalLift(
     ocm.orientation.w = q_upright.w();
     
     // STRICT tolerances to enforce precise RPY during OMPL planning
+    
     ocm.absolute_x_axis_tolerance = 3.14; 
     ocm.absolute_y_axis_tolerance = 0.2;
     ocm.absolute_z_axis_tolerance = 0.2; 
@@ -367,6 +378,7 @@ bool smartVerticalLift(
             ascent_success = true;
         }
     }
+    
     iface.clearPathConstraints();
 
     if (!ascent_success) {
@@ -377,6 +389,7 @@ bool smartVerticalLift(
 }
 
 // MAIN
+
 int main(int argc, char * argv[])
 {
     rclcpp::init(argc, argv);
@@ -459,6 +472,7 @@ int main(int argc, char * argv[])
             std::cout << ">>> Pouring the liquid...\n";
             
             // 1. Get current joint positions
+
             std::vector<double> joint_positions;
             moveit::core::RobotStatePtr current_state = arm_interface.getCurrentState();
             const moveit::core::JointModelGroup* joint_model_group = 
@@ -469,41 +483,47 @@ int main(int argc, char * argv[])
                 double original_last_joint = joint_positions.back();
                 
                 // 2. Add 90 degrees (pi/2) to the last joint
+
                 joint_positions.back() = original_last_joint + (M_PI / 2.0);
                 arm_interface.setJointValueTarget(joint_positions);
                 
                 // 3. Execute the pour
+
                 if (arm_interface.move() == moveit::core::MoveItErrorCode::SUCCESS) {
                     waitForStateSettle(arm_interface);
-                    std::cout << "    [+] Poured. Waiting 1 second...\n";
+                    std::cout << "    [+] Tube Rotated. Waiting...\n";
                     
                     // Wait for liquid to drain
+
                     rclcpp::sleep_for(std::chrono::seconds(1));
 
                     // 4. Return to the upright state
+
                     std::cout << "    [+] Returning to upright...\n";
                     joint_positions.back() = original_last_joint;
                     arm_interface.setJointValueTarget(joint_positions);
                     arm_interface.move();
                     waitForStateSettle(arm_interface);
                     
-                    std::cout << ">>> Pour sequence complete!\n";
+                    std::cout << ">>> The liquid was poured!\n";
                 } else {
-                    std::cout << "    [-] Could not execute pour. Joint limit reached?\n";
+                    std::cout << "    [-] Could not execute pour.\n";
                 }
             }
             continue;
         }
 
         // 2. Parse as Coordinates
+
         std::stringstream ss(line);
         double tx, ty, tz;
         if (!(ss >> tx >> ty >> tz)) {
-            std::cout << "[-] Invalid input. Use 'o', 'c', 'p', or three numbers.\n";
+            std::cout << "[-] Invalid input. Use 'O', 'C', 'P', or the Coordinates.\n";
             continue;
         }
 
         // PHASE 1: LIFT  — 2-Stage Smart Lift to fixed SAFE_Z_TARGET
+
         std::cout << "\n--- [PHASE 1] LIFT to Standard Z=" << SAFE_Z_TARGET << " ---\n";
 
         arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
@@ -513,11 +533,12 @@ int main(int argc, char * argv[])
             waitForStateSettle(arm_interface);
         } else {
             std::cout << "[-] [PHASE 1] Cannot reach standard lift height Z=" << SAFE_Z_TARGET 
-                      << ". Skipping this target.\n";
+                      << ". Skipping the target.\n";
             continue;
         }
 
         // --- [PHASE 2] OPTIMIZED HORIZONTAL MOVE ---
+
         std::cout << "\n--- [PHASE 2] HORIZONTAL MOVE to (" << tx << ", " << ty << ") ---\n";
 
         arm_interface.setStartStateToCurrentState();
@@ -529,6 +550,7 @@ int main(int argc, char * argv[])
         bool moved = false;
 
         // Try DIRECT path first
+
         if (strictCartesianMove(arm_interface, target_pose, "HORIZ_DIRECT")) {
             waitForStateSettle(arm_interface);
             moved = true;
@@ -536,6 +558,7 @@ int main(int argc, char * argv[])
             std::cout << "    [-] Direct path blocked. Running Virtual Look-Ahead for detours...\n";
 
             // Geometry for Detour Calculation
+
             double dx = tx - start_pose.position.x;
             double dy = ty - start_pose.position.y;
             double mid_x = start_pose.position.x + (dx / 2.0);
@@ -546,6 +569,7 @@ int main(int argc, char * argv[])
             perp_x /= mag; perp_y /= mag;
 
             // Broader range of offsets for 7-DOF flexibility
+
             std::vector<double> offsets = {0.01, -0.01, 0.02, -0.02, 0.03, -0.03, 0.04, -0.04, 0.05, -0.05, 0.06, -0.06, 0.07, -0.07, 0.08, -0.08, 0.09, -0.09, 0.1, -0.1, 0.11, -0.11, 0.12, -0.12, 0.13, -0.13, 0.14, -0.14, 0.15, -0.15, 0.16, -0.16, 0.17, -0.17, 0.18, -0.18, 0.19, -0.19, 0.2, -0.2, 0.21, -0.21, 0.22, -0.22, 0.23, -0.23};
 
             for (double offset : offsets) {
@@ -554,13 +578,16 @@ int main(int argc, char * argv[])
                 detour_pose.position.y = mid_y + (perp_y * offset);
 
                 // VIRTUAL CHECK LEG 1 (A -> C)
+
                 moveit_msgs::msg::RobotTrajectory traj1;
                 std::vector<geometry_msgs::msg::Pose> way1 = {detour_pose};
                 double frac1 = arm_interface.computeCartesianPath(way1, CARTESIAN_EEF_STEP, CARTESIAN_JUMP_THR, traj1);
 
                 if (frac1 >= MIN_CARTESIAN_FRACTION) {
+
                     // VIRTUAL CHECK LEG 2 (C -> B)
                     // We simulate the robot state at the end of Leg 1
+
                     moveit::core::RobotState temp_state(*arm_interface.getCurrentState());
                     temp_state.setJointGroupPositions("arm_group", traj1.joint_trajectory.points.back().positions);
                     
@@ -573,6 +600,7 @@ int main(int argc, char * argv[])
                         std::cout << "    [+] Valid Detour Found (Offset: " << offset*100 << "cm). Executing Leg 1...\n";
                         
                         // Execute Leg 1
+
                         arm_interface.setStartStateToCurrentState(); // Reset to reality for execution
                         arm_interface.execute(traj1);
                         waitForStateSettle(arm_interface);
@@ -586,6 +614,7 @@ int main(int argc, char * argv[])
                     }
                 }
                 // Reset start state for next iteration trial
+
                 arm_interface.setStartStateToCurrentState();
             }
         }
@@ -607,7 +636,6 @@ int main(int argc, char * argv[])
             ocm.orientation.z = q_upright.z();
             ocm.orientation.w = q_upright.w();
             
-            // Your corrected tolerances!
             ocm.absolute_x_axis_tolerance = 3.14; 
             ocm.absolute_y_axis_tolerance = 0.2;
             ocm.absolute_z_axis_tolerance = 0.2; 
@@ -634,6 +662,7 @@ int main(int argc, char * argv[])
         }
         
         // PHASE 3: DROP  — straight down to target Z
+  
         std::cout << "\n--- [PHASE 3] DROP to Z=" << tz << " ---\n";
 
         arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
@@ -646,6 +675,7 @@ int main(int argc, char * argv[])
              z_try += DROP_Z_RETRY_STEP)
         {
             // Use our new 2-stage drop function instead of basic Cartesian
+  
             if (smartVerticalDrop(arm_interface, z_try, q_upright)) {
                 dropped = true;
                 waitForStateSettle(arm_interface);
@@ -665,7 +695,7 @@ int main(int argc, char * argv[])
         }
     }
 
-    std::cout << "\n>>> Shutting down. Goodbye!\n";
+    std::cout << "\n>>> Shutting down.\n";
     rclcpp::shutdown();
     spinner.join();
     return 0;
