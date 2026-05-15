@@ -20,13 +20,16 @@
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
 #include <moveit_msgs/msg/collision_object.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 
 // CONSTANTS
 
-static constexpr double VEL_SCALE_TRANSIT  = 0.10; 
-static constexpr double VEL_SCALE_LIQUID   = 0.05; 
-static constexpr double ACC_SCALE_TRANSIT  = 0.10;
-static constexpr double ACC_SCALE_LIQUID   = 0.05;
+static constexpr double VEL_SCALE_TRANSIT  = 0.9; 
+static constexpr double VEL_SCALE_LIQUID   = 0.8; 
+static constexpr double ACC_SCALE_TRANSIT  = 0.80;
+static constexpr double ACC_SCALE_LIQUID   = 0.60;
 static constexpr double CARTESIAN_EEF_STEP = 0.005; 
 static constexpr double CARTESIAN_JUMP_THR = 2.0;   
 static constexpr double MIN_CARTESIAN_FRACTION = 0.95; 
@@ -37,7 +40,7 @@ static constexpr double SAFE_Z_TARGET      = 0.28;
 
 // Drop Retry Constants (Kept for Phase 3 safety)
 static constexpr double DROP_Z_RETRY_STEP  = 0.001;  
-static constexpr double DROP_Z_MAX_RETRY   = 0.05;  
+static constexpr double DROP_Z_MAX_RETRY   = 0.08;  
 static constexpr int    STATE_SETTLE_MS    = 500;   
 
 // --- NEW HELPER: Setup Environment Collisions ---
@@ -73,7 +76,7 @@ void setupCollisionObjects(const std::string& frame_id) {
     wall.primitives[0].dimensions = {
         0.4 - (-0.4),        
         0.20 - 0,
-        0.05 - 0.0
+        0.1 - 0.0
     };
     
     wall.primitive_poses.resize(1);
@@ -83,6 +86,29 @@ void setupCollisionObjects(const std::string& frame_id) {
     wall.primitive_poses[0].orientation.w = 1.0;
     wall.operation = wall.ADD;
     collision_objects.push_back(wall);
+    
+    // 3. 2nd Obstacle Box
+    
+    moveit_msgs::msg::CollisionObject wall2;
+    wall2.id = "obstacle_box_2";
+    wall2.header.frame_id = frame_id;
+    wall2.primitives.resize(1);
+    wall2.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
+    
+    wall2.primitives[0].dimensions = {
+        0.2 - 0.0,        
+        0.4 - 0.0,
+        0.3 - 0.0
+    };
+    
+    wall2.primitive_poses.resize(1);
+    wall2.primitive_poses[0].position.x = -0.4;
+    wall2.primitive_poses[0].position.y = 0.1;
+    wall2.primitive_poses[0].position.z = 0.00;   
+    wall2.primitive_poses[0].orientation.w = 1.0;
+    wall2.operation = wall2.ADD;
+    collision_objects.push_back(wall2);
+    
     planning_scene_interface.applyCollisionObjects(collision_objects);
     std::cout << ">>> [INIT] Collision objects loaded into scene.\n";
 }
@@ -168,7 +194,7 @@ bool horizontalTransitUpright(
     // 1. Try Pilz LIN first
     iface.setPlanningPipelineId("pilz_industrial_motion_planner");
     iface.setPlannerId("LIN");
-    iface.setPlanningTime(15.0);
+    iface.setPlanningTime(5.0);
     iface.setPoseTarget(target_pose);
 
     moveit::planning_interface::MoveGroupInterface::Plan plan;
@@ -182,7 +208,7 @@ bool horizontalTransitUpright(
     // 2. LIN failed, fallback to Constrained OMPL
     iface.setPlanningPipelineId("ompl");
     iface.setPlannerId("RRTConnectkConfigDefault");
-    iface.setPlanningTime(15.0);
+    iface.setPlanningTime(5.0);
     iface.setPoseTarget(target_pose);
 
     moveit_msgs::msg::OrientationConstraint ocm;
@@ -246,7 +272,7 @@ bool smartVerticalDrop(
     
     iface.setPlanningPipelineId("ompl");
     iface.setPlannerId("RRTConnectkConfigDefault");
-    iface.setPlanningTime(10.0);
+    iface.setPlanningTime(5.0);
     iface.setPoseTarget(approach_pose);
 
     // Keep the tube rigidly aligned to the specified RPY constraints
@@ -345,7 +371,7 @@ bool smartVerticalLift(
     
     iface.setPlanningPipelineId("ompl");
     iface.setPlannerId("RRTConnectkConfigDefault");
-    iface.setPlanningTime(10.0);
+    iface.setPlanningTime(5.0);
     iface.setPoseTarget(final_pose);
 
     // Keep the tube rigidly aligned to the specified RPY constraints
@@ -402,6 +428,10 @@ int main(int argc, char * argv[])
     using moveit::planning_interface::MoveGroupInterface;
     MoveGroupInterface arm_interface(node, "arm_group");
     MoveGroupInterface gripper_interface(node, "gripper");
+    
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer = std::make_unique<tf2_ros::Buffer>(node->get_clock());
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
+    
     rclcpp::sleep_for(std::chrono::seconds(1));
     setupCollisionObjects(arm_interface.getPlanningFrame());
 
@@ -512,14 +542,52 @@ int main(int argc, char * argv[])
             }
             continue;
         }
-
-        // 2. Parse as Coordinates
-
-        std::stringstream ss(line);
+        
+        
         double tx, ty, tz;
-        if (!(ss >> tx >> ty >> tz)) {
-            std::cout << "[-] Invalid input. Use 'O', 'C', 'P', or the Coordinates.\n";
-            continue;
+
+        if (line[0] == 'm' || line[0] == 'M') {
+            int marker_id;
+            std::stringstream ss(line.substr(1));
+            if (ss >> marker_id) {
+                // If the user requests the anchor itself
+                if (marker_id == 0) {
+                    tx = 0.0;
+                    ty = -0.065;
+                    tz = 0.20;
+                    std::cout << "    [+] Anchor Marker 0 at Base Coordinates: (" << tx << ", " << ty << ", " << tz << ")\n";
+                } else {
+                    // Look up dynamically via TF2
+                    std::cout << ">>> Looking up position for Marker " << marker_id << " via camera TF...\n";
+                    try {
+                        std::string target_frame = "marker_" + std::to_string(marker_id);
+                        
+                        // We ask the buffer: "Where is marker_X relative to marker_base?"
+                        geometry_msgs::msg::TransformStamped t = tf_buffer->lookupTransform(
+                            "marker_base", target_frame, tf2::TimePointZero, std::chrono::milliseconds(500));
+                        
+                        // Convert from marker_base frame to robot base frame
+                        tx = t.transform.translation.x + 0.0;
+                        ty = t.transform.translation.y + 0.11;
+                        tz = 0.15; // Enforce the hardcoded Z=0.20 height you requested
+                        
+                        std::cout << "    [+] Marker " << marker_id << " Found! Robot Coordinates: (" << tx << ", " << ty << ", " << tz << ")\n";
+                    } catch (const tf2::TransformException & ex) {
+                        std::cout << "    [-] Could not find Marker " << marker_id << " in TF tree. Is it visible?\n";
+                        continue;
+                    }
+                }
+            } else {
+                std::cout << "[-] Invalid marker input. Example: 'M 2'\n";
+                continue;
+            }
+        } else {
+            
+            std::stringstream ss(line);
+            if (!(ss >> tx >> ty >> tz)) {
+                std::cout << "[-] Invalid input. \n";
+                continue;
+            }
         }
 
         // PHASE 1: LIFT  — 2-Stage Smart Lift to fixed SAFE_Z_TARGET
@@ -625,7 +693,7 @@ int main(int argc, char * argv[])
             
             arm_interface.setPlanningPipelineId("ompl");
             arm_interface.setPlannerId("RRTConnectkConfigDefault");
-            arm_interface.setPlanningTime(15.0);
+            arm_interface.setPlanningTime(5.0);
             arm_interface.setPoseTarget(target_pose);
 
             moveit_msgs::msg::OrientationConstraint ocm;
