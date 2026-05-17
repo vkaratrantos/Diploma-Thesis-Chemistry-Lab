@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import datetime
 import threading
+import time
 import sys
 
 # --- ROS 2 LIBRARIES ---
@@ -44,6 +45,11 @@ class LabApp:
         self.root.configure(bg=COLOR_BG)
 
         self.manual_batch = [] 
+        
+        # FIX: Safety locks and debouncers to prevent double-firing
+        self.sequence_lock = threading.Lock()
+        self.last_manual_cmd = ""
+        self.last_manual_time = 0
 
         # --- NATIVE ROS 2 INITIALIZATION ---
         rclpy.init(args=None)
@@ -99,25 +105,29 @@ class LabApp:
         print(f"[{timestamp}] [GUI] {message}")
 
     # --- THE MAGIC PIPELINE ---
-    def send_command(self, cmd):
+    def send_command(self, cmd, manual=False):
         """Publishes the command instantly as a native ROS 2 node."""
+        
+        # FIX: Mouse-Bounce Debouncer for Manual Clicks
+        if manual:
+            current_time = time.time()
+            if cmd == self.last_manual_cmd and (current_time - self.last_manual_time) < 0.3:
+                return # Ignore accidental physical double-clicks within 0.3 seconds
+            self.last_manual_cmd = cmd
+            self.last_manual_time = current_time
+
         msg = String()
         msg.data = str(cmd)
         self.publisher.publish(msg)
         self.log(f"Command fired -> {cmd}")
 
-    def queue_tube_sequence(self, marker_id):
-        """Sends the pick, place, and pour sequence step-by-step."""
-        # Using a slight delay thread so it doesn't slam the network all at once
-        def sequence():
-            import time
-            commands = ["o", f"m {marker_id}", "c", "m 6", "p", f"m {marker_id}", "o"]
-            for cmd in commands:
-                self.send_command(cmd)
-                # Give the C++ script a tiny moment to register each command
-                time.sleep(0.1) 
-                
-        threading.Thread(target=sequence, daemon=True).start()
+    def _send_sequence_for_marker(self, marker_id):
+        """Sends the sequence for a single tube. (No longer spins up rogue threads)"""
+        commands = ["o", f"m {marker_id}", "c", "m 6", "p", f"m {marker_id}", "o"]
+        for cmd in commands:
+            self.send_command(cmd)
+            # Give the C++ script a tiny moment to register each command
+            time.sleep(0.1) 
 
     # --- AUTO MODE ---
     def build_auto_tab(self):
@@ -135,8 +145,14 @@ class LabApp:
     def run_recipe(self, recipe_name):
         markers = RECIPES[recipe_name]
         self.log(f"Auto-Sequence Started: {recipe_name}")
-        for marker in markers:
-            self.queue_tube_sequence(marker)
+        
+        # FIX: A single unified thread handles all markers perfectly in order
+        def task():
+            with self.sequence_lock:
+                for marker in markers:
+                    self._send_sequence_for_marker(marker)
+                    
+        threading.Thread(target=task, daemon=True).start()
 
     # --- MANUAL MODE ---
     def build_manual_tab(self):
@@ -151,21 +167,22 @@ class LabApp:
         actions_frame = tk.Frame(override_frame, bg=COLOR_PANEL)
         actions_frame.pack(pady=5)
 
+        # Note: Added 'manual=True' to engage the debouncer
         tk.Button(actions_frame, text="OPEN GRIPPER", bg="#333", fg="white", width=15, font=("Arial", 12, "bold"), 
-                  command=lambda: self.send_command("o")).grid(row=0, column=0, padx=10)
+                  command=lambda: self.send_command("o", manual=True)).grid(row=0, column=0, padx=10)
         tk.Button(actions_frame, text="CLOSE GRIPPER", bg="#333", fg="white", width=15, font=("Arial", 12, "bold"), 
-                  command=lambda: self.send_command("c")).grid(row=0, column=1, padx=10)
+                  command=lambda: self.send_command("c", manual=True)).grid(row=0, column=1, padx=10)
         tk.Button(actions_frame, text="POUR LIQUID", bg="#333", fg="white", width=15, font=("Arial", 12, "bold"), 
-                  command=lambda: self.send_command("p")).grid(row=0, column=2, padx=10)
+                  command=lambda: self.send_command("p", manual=True)).grid(row=0, column=2, padx=10)
         tk.Button(actions_frame, text="GO TO MIXER", bg="#333", fg="white", width=15, font=("Arial", 12, "bold"), 
-                  command=lambda: self.send_command("m 6")).grid(row=0, column=3, padx=10)
+                  command=lambda: self.send_command("m 6", manual=True)).grid(row=0, column=3, padx=10)
 
         targets_frame = tk.Frame(override_frame, bg=COLOR_PANEL)
         targets_frame.pack(pady=10)
 
         for i in range(1, 6):
             tk.Button(targets_frame, text=f"GO TO TUBE {i}", bg="#222", fg="white", width=12, font=("Arial", 10), 
-                      command=lambda m=i: self.send_command(f"m {m}")).grid(row=0, column=i-1, padx=5)
+                      command=lambda m=i: self.send_command(f"m {m}", manual=True)).grid(row=0, column=i-1, padx=5)
 
         # MANUAL BATCH
         batch_frame = tk.LabelFrame(main_frame, text=" MANUAL BATCH PROTOCOL ", 
@@ -205,12 +222,21 @@ class LabApp:
             return
 
         self.log("Starting Manual Dispense Protocol...")
-        for tube_string in self.manual_batch:
-            marker_id = tube_string.split(" ")[1]
-            self.queue_tube_sequence(marker_id)
-            
+        
+        # Copy the list and clear the UI immediately
+        batch_to_run = list(self.manual_batch)
         self.manual_batch.clear()
         self.batch_lbl.config(text="SEQUENCE: 0 ITEMS PENDING", fg=COLOR_TEXT_DIM)
+
+        # FIX: Unified thread logic prevents batch interleaving
+        def task():
+            with self.sequence_lock:
+                for tube_string in batch_to_run:
+                    marker_id = tube_string.split(" ")[1]
+                    self._send_sequence_for_marker(marker_id)
+            self.log("Manual Sequence Completed.")
+
+        threading.Thread(target=task, daemon=True).start()
 
 if __name__ == "__main__":
     root = tk.Tk()
