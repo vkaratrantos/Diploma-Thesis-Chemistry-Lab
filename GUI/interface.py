@@ -1,6 +1,20 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import datetime
+import subprocess
+import threading
+import sys
+import os
+
+HOME = os.path.expanduser("~")
+
+# Notice we changed 'ros2 launch' to 'ros2 run', and targeted the executable directly!
+ROBOT_CMD = [
+    "bash", 
+    "-i", 
+    "-c", 
+    f"cd {HOME}/ws_moveit2 && source install/setup.bash && cd {HOME}/elephant_robots_ws && source install/setup.bash && ros2 run my_robot_control simple_move"
+]
 
 # Configuration
 
@@ -12,13 +26,14 @@ REAGENTS = {
     "Tube 5": "Ammonia (NH3)"
 }
 
+# Updated to store just the Marker IDs required for the sequence
 RECIPES = {
-    "Copper Hydroxide - Cu(OH)2": {"formula": "CuSO4 + 2NaOH -> Cu(OH)2", "mix": {"Tube 1": 20, "Tube 2": 20}},
-    "Copper Carbonate - CuCO3": {"formula": "CuSO4 + Na2CO3 -> CuCO3", "mix": {"Tube 1": 20, "Tube 3": 20}},
-    "Carbon Dioxide - CO2": {"formula": "2HCl + Na2CO3 -> CO2 + ...", "mix": {"Tube 4": 25, "Tube 3": 25}},
-    "Ammonium Chloride - NH4Cl": {"formula": "HCl + NH3 -> NH4Cl", "mix": {"Tube 4": 10, "Tube 5": 10}},
-    "Royal Blue Complex - [Cu(NH3)4]2+": {"formula": "CuSO4 + 4NH3 -> [Cu(NH3)4]2+", "mix": {"Tube 1": 15, "Tube 5": 30}},
-    "Neutralization": {"formula": "HCl + NaOH -> NaCl + H2O", "mix": {"Tube 4": 25, "Tube 2": 25}}
+    "Copper Hydroxide - Cu(OH)2": [1, 2],
+    "Copper Carbonate - CuCO3": [1, 3],
+    "Carbon Dioxide - CO2": [3, 4],
+    "Ammonium Chloride - NH4Cl": [4, 5],
+    "Royal Blue Complex - [Cu(NH3)4]2+": [1, 5],
+    "Neutralization": [4, 2]
 }
 
 # Colors
@@ -35,13 +50,16 @@ class LabApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Automated Chemical Synthesis")
-        self.root.geometry("1200x1000")
+        self.root.geometry("1200x800") 
         self.root.configure(bg=COLOR_BG)
 
-        self.manual_batch = {} 
+        self.manual_batch = [] 
+        self.robot_process = None
+
+        # Start the C++ Subprocess
+        self.start_robot_process()
 
         # Header
-
         header_frame = tk.Frame(root, bg=COLOR_BG, pady=20)
         header_frame.pack(fill="x")
         
@@ -50,7 +68,6 @@ class LabApp:
         tk.Frame(root, bg=COLOR_BORDER, height=2).pack(fill="x", padx=40, pady=(0, 20))
 
         # Tabs
-
         style = ttk.Style()
         style.theme_use('alt') 
         style.configure("TNotebook", background=COLOR_BG, borderwidth=0)
@@ -65,48 +82,83 @@ class LabApp:
         self.tab_auto.pack(fill="both", expand=True, padx=2, pady=2) 
         self.tab_manual = tk.Frame(self.tab_manual_container, bg=COLOR_PANEL)
         self.tab_manual.pack(fill="both", expand=True, padx=2, pady=2) 
+        
         self.notebook.add(self.tab_auto_container, text="AUTO SYNTHESIS")
         self.notebook.add(self.tab_manual_container, text="MANUAL CONTROL")
+        
         self.build_auto_tab()
         self.build_manual_tab()
-        self.build_log_area()
 
-    def build_log_area(self):
-        outer_container = tk.Frame(self.root, bg=COLOR_BG, pady=20, padx=40)
-        outer_container.pack(side="bottom", fill="both", expand=True)
-        lbl = tk.Label(outer_container, text="SYSTEM ACTIVITY LOG", font=("Arial", 16, "bold"), bg=COLOR_BG, fg="white", anchor="w")
-        lbl.pack(fill="x", pady=(0, 5))
-        border_frame = tk.Frame(outer_container, bg=COLOR_BORDER)
-        border_frame.pack(fill="both", expand=True)
-        inner_frame = tk.Frame(border_frame, bg=COLOR_PANEL)
-        inner_frame.pack(fill="both", expand=True, padx=2, pady=2) 
-        self.log_text = tk.Text(inner_frame, height=18, bg=COLOR_PANEL, fg="#cccccc", 
-                                font=("Arial", 14), bd=0, relief="flat", padx=15, pady=15)
-        self.log_text.pack(fill="both", expand=True)
+        self.log("System Ready. UI Initialized.")
 
-        # Tags
-        self.log_text.tag_configure("time", foreground=COLOR_TEXT_DIM, font=("Arial", 14))
-        self.log_text.tag_configure("blue_bold", foreground="#00aaff", font=("Arial", 14, "bold"))
-        self.log_text.tag_configure("normal", foreground=COLOR_TEXT_MAIN)
-        self.log_text.tag_configure("success", foreground="#00ff00", font=("Arial", 14, "bold"))
+    # --- ROBOT COMMUNICATION LOGIC ---
 
-        self.log("System Ready. Extended Log Area Loaded.", "normal")
+    def start_robot_process(self):
+        """Launches the C++ file in the background and listens to it."""
+        import time # Ensure time is imported
+        try:
+            self.robot_process = subprocess.Popen(
+                ROBOT_CMD,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            # Run a thread to echo the C++ prints to the terminal
+            threading.Thread(target=self.monitor_robot_output, daemon=True).start()
 
-    def log(self, message, style="normal"):
+            # --- NEW CRASH CATCHER ---
+            # Wait half a second to see if the launch command instantly fails
+            time.sleep(0.5)
+            if self.robot_process.poll() is not None:
+                # The process died. Grab the error output.
+                out, _ = self.robot_process.communicate()
+                print(f"\n[!!!] FATAL: Robot process crashed instantly (Exit Code: {self.robot_process.returncode})")
+                print(f"[!!!] BASH ERROR LOG:\n{out}")
+                
+        except Exception as e:
+            print(f"[-] ERROR STARTING ROBOT SCRIPT: {e}")
+            print(f"[-] ERROR STARTING ROBOT SCRIPT: {e}")
+
+    def monitor_robot_output(self):
+        """Constantly reads the stdout of the C++ script and prints it to your terminal."""
+        if self.robot_process:
+            for line in self.robot_process.stdout:
+                # Print directly to terminal so you see MoveIt planning outputs
+                sys.stdout.write(line)
+                sys.stdout.flush()
+
+    def send_command(self, cmd):
+        """Sends a single string command to the C++ std::cin pipe."""
+        if self.robot_process and self.robot_process.poll() is None:
+            self.robot_process.stdin.write(cmd + "\n")
+            self.robot_process.stdin.flush()
+        else:
+            print(f"[-] WARNING: Cannot send '{cmd}', robot script is not running.")
+
+    def queue_tube_sequence(self, marker_id):
+        """Generates and sends the pick, place, and pour sequence for a specific marker."""
+        commands = [
+            "o",               # Open Gripper
+            f"m {marker_id}",  # Go to the requested tube
+            "c",               # Close Gripper
+            "m 6",             # Go to Mix Tube
+            "p",               # Pour
+            f"m {marker_id}",  # Return tube to its original spot
+            "o"                # Open Gripper
+        ]
+        for cmd in commands:
+            self.send_command(cmd)
+
+    def log(self, message):
+        """Logs high-level Python events to your terminal."""
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}]  ", "time")
-        
-        if "ENGAGED" in message or "ACTIVATED" in message or "Added" in message:
-            style = "blue_bold"
-        elif "Completed" in message or "SUCCESS" in message:
-            style = "success"
+        print(f"\n[{timestamp}] [GUI] {message}\n")
 
-        self.log_text.insert(tk.END, message + "\n\n", style)
-        self.log_text.see(tk.END)
-
-    # Auto Mode 
+    # --- AUTO MODE ---
+    
     def build_auto_tab(self):
-        # Container for the buttons
         container = tk.Frame(self.tab_auto, bg=COLOR_PANEL)
         container.pack(expand=True, fill="both", pady=40)
 
@@ -119,14 +171,17 @@ class LabApp:
             btn.pack(pady=10)
 
     def run_recipe(self, recipe_name):
-        target = RECIPES[recipe_name]
-        self.log(f"Auto-Sequence Started: {recipe_name}", "normal")
-        for pump, amount in target['mix'].items():
-            chem_name = REAGENTS[pump]
-            self.log(f"PUMP {pump} ENGAGED -> {amount}ml ({chem_name})")
-        self.log("Sequence Completed Successfully.")
+        markers = RECIPES[recipe_name]
+        self.log(f"Auto-Sequence Started: {recipe_name}")
+        
+        for marker in markers:
+            self.log(f"Queuing sequence for Marker {marker}...")
+            self.queue_tube_sequence(marker)
+            
+        self.log("All commands for recipe sent to robot buffer.")
 
-    # Manual Mode
+    # --- MANUAL MODE ---
+    
     def build_manual_tab(self):
         main_frame = tk.Frame(self.tab_manual, bg=COLOR_PANEL)
         main_frame.pack(fill="both", expand=True, padx=40, pady=30)
@@ -134,25 +189,15 @@ class LabApp:
         controls_frame = tk.Frame(main_frame, bg=COLOR_PANEL)
         controls_frame.pack()
 
-        self.sliders = {} 
-
         for i, (pump_id, chem_name) in enumerate(REAGENTS.items()):
             tk.Label(controls_frame, text=f"{pump_id} | {chem_name}", width=30, anchor="w", 
                      bg=COLOR_PANEL, fg="#ccc", font=("Arial", 14)).grid(row=i, column=0, padx=15, pady=20)
-
-            # Sliders
-            s = tk.Scale(controls_frame, from_=0, to=50, orient="horizontal", length=350, 
-                         bg=COLOR_PANEL, fg=COLOR_BLUE_NEON, highlightthickness=0, 
-                         troughcolor="#000", activebackground=COLOR_BLUE_NEON,
-                         font=("Arial", 18, "bold")) 
-            s.grid(row=i, column=1, padx=25)
-            self.sliders[pump_id] = s
 
             btn_add = tk.Button(controls_frame, text="ADD", bg="#333", fg="white", width=10, height=1, relief="flat",
                                 font=("Arial", 12, "bold"), 
                                 activebackground=COLOR_BLUE_NEON, activeforeground="black",
                                 command=lambda p=pump_id, n=chem_name: self.add_to_batch(p, n))
-            btn_add.grid(row=i, column=2, padx=15)
+            btn_add.grid(row=i, column=1, padx=15)
 
         self.batch_lbl = tk.Label(main_frame, text="BATCH: 0 ITEMS PENDING", font=("Arial", 18, "bold"), bg=COLOR_PANEL, fg=COLOR_TEXT_DIM)
         self.batch_lbl.pack(pady=30)
@@ -164,30 +209,26 @@ class LabApp:
         btn_exec.pack(side="bottom", pady=20)
 
     def add_to_batch(self, pump_id, name):
-        slider = self.sliders[pump_id]
-        amount = slider.get()
-        if amount == 0: return
-
-        if pump_id in self.manual_batch:
-            self.manual_batch[pump_id] += amount
-        else:
-            self.manual_batch[pump_id] = amount
-
-        self.log(f"Manual Added: {amount}ml of {name}", "normal")
+        self.manual_batch.append(pump_id)
+        self.log(f"Manual Added: {name} ({pump_id})")
         self.batch_lbl.config(text=f"BATCH: {len(self.manual_batch)} ITEM(S) PENDING", fg="#00aaff")
-        slider.set(0)
 
     def execute_batch(self):
         if not self.manual_batch:
-            messagebox.showwarning("Error", "No volumes added.")
+            messagebox.showwarning("Error", "No ingredients added.")
             return
 
-        self.log("Starting Manual Dispense Protocol...", "normal")
-        for pump, amount in self.manual_batch.items():
-            name = REAGENTS[pump]
-            self.log(f"PUMP {pump} ENGAGED -> {amount}ml ({name})")
-        self.log("Manual Protocol Completed Successfully.")
-        self.manual_batch = {}
+        self.log("Starting Manual Dispense Protocol...")
+        for tube_string in self.manual_batch:
+            # Extract the number from "Tube 1", "Tube 2", etc.
+            marker_id = tube_string.split(" ")[1]
+            self.log(f"Queuing sequence for Marker {marker_id}...")
+            self.queue_tube_sequence(marker_id)
+            
+        self.log("Manual Protocol commands sent to robot buffer.")
+        
+        # Reset batch
+        self.manual_batch.clear()
         self.batch_lbl.config(text="BATCH: 0 ITEMS PENDING", fg=COLOR_TEXT_DIM)
 
 if __name__ == "__main__":
