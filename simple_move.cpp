@@ -23,6 +23,7 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <std_msgs/msg/string.hpp>
 
 // CONSTANTS
 
@@ -564,17 +565,49 @@ int main(int argc, char * argv[])
                         
                         // We ask the buffer: "Where is marker_X relative to marker_base?"
                         geometry_msgs::msg::TransformStamped t = tf_buffer->lookupTransform(
-                            "marker_base", target_frame, tf2::TimePointZero, std::chrono::milliseconds(500));
+                            "marker_base", target_frame, tf2::TimePointZero);
                         
                         // Convert from marker_base frame to robot base frame
                         tx = t.transform.translation.x + 0.0;
                         ty = t.transform.translation.y + 0.11;
-                        tz = 0.15; // Enforce the hardcoded Z=0.20 height you requested
+                        tz = 0.15; // Enforce the hardcoded Z height 
                         
                         std::cout << "    [+] Marker " << marker_id << " Found! Robot Coordinates: (" << tx << ", " << ty << ", " << tz << ")\n";
                     } catch (const tf2::TransformException & ex) {
-                        std::cout << "    [-] Could not find Marker " << marker_id << " in TF tree. Is it visible?\n";
-                        continue;
+                        std::cout << "    [-] Could not find Marker " << marker_id << " in TF tree. Falling back to hardcoded positions...\n";
+                        
+                        // --- NEW FALLBACK LOGIC ---
+                        if (marker_id == 1) {
+                            tx = -0.15;
+                            ty = -0.15;
+                            tz = 0.1;
+                        } else if (marker_id == 2) {
+                            tx = -0.05;
+                            ty = -0.20;
+                            tz = 0.12;
+                        } else if (marker_id == 3) {
+                            tx = 0.00;
+                            ty = -0.22;
+                            tz = 0.11;
+                        } else if (marker_id == 4) {
+                            tx = 0.05;
+                            ty = -0.16;
+                            tz = 0.12;
+                        } else if (marker_id == 5) {
+                            tx = 0.15;
+                            ty = -0.15;
+                            tz = 0.12;
+                        } else if (marker_id == 6) {
+                            tx = -0.2;
+                            ty = -0.1;
+                            tz = 0.12;       
+                        } else {
+                            // If the marker ID is entirely unknown
+                            std::cout << "    [-] No fallback defined for Marker " << marker_id << ". Aborting move.\n";
+                            continue; 
+                        }
+                        
+                        std::cout << "    [+] Fallback engaged. Target Coordinates: (" << tx << ", " << ty << ", " << tz << ")\n";
                     }
                 }
             } else {
@@ -582,7 +615,7 @@ int main(int argc, char * argv[])
                 continue;
             }
         } else {
-            
+            // Standard XYZ coordinate parsing
             std::stringstream ss(line);
             if (!(ss >> tx >> ty >> tz)) {
                 std::cout << "[-] Invalid input. \n";
