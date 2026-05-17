@@ -1,23 +1,15 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import datetime
-import subprocess
 import threading
 import sys
-import os
 
-HOME = os.path.expanduser("~")
-
-# Notice we changed 'ros2 launch' to 'ros2 run', and targeted the executable directly!
-ROBOT_CMD = [
-    "bash", 
-    "-i", 
-    "-c", 
-    f"cd {HOME}/ws_moveit2 && source install/setup.bash && cd {HOME}/elephant_robots_ws && source install/setup.bash && ros2 run my_robot_control simple_move"
-]
+# --- ROS 2 LIBRARIES ---
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
 
 # Configuration
-
 REAGENTS = {
     "Tube 1": "Copper Sulfate (CuSO4)",
     "Tube 2": "Sodium Hydroxide (NaOH)",
@@ -26,7 +18,6 @@ REAGENTS = {
     "Tube 5": "Ammonia (NH3)"
 }
 
-# Updated to store just the Marker IDs required for the sequence
 RECIPES = {
     "Copper Hydroxide - Cu(OH)2": [1, 2],
     "Copper Carbonate - CuCO3": [1, 3],
@@ -37,7 +28,6 @@ RECIPES = {
 }
 
 # Colors
-
 COLOR_BG = "#0a0a0a"
 COLOR_PANEL = "#141414"
 COLOR_BLUE_NEON = "#0066cc"
@@ -50,14 +40,18 @@ class LabApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Automated Chemical Synthesis")
-        self.root.geometry("1200x800") 
+        self.root.geometry("1200x850") 
         self.root.configure(bg=COLOR_BG)
 
         self.manual_batch = [] 
-        self.robot_process = None
 
-        # Start the C++ Subprocess
-        self.start_robot_process()
+        # --- NATIVE ROS 2 INITIALIZATION ---
+        rclpy.init(args=None)
+        self.ros_node = rclpy.create_node('gui_commander_node')
+        self.publisher = self.ros_node.create_publisher(String, '/gui_commands', 10)
+        
+        # Ensure ROS 2 shuts down cleanly when you close the window
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # Header
         header_frame = tk.Frame(root, bg=COLOR_BG, pady=20)
@@ -76,6 +70,7 @@ class LabApp:
 
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(expand=False, fill="both", padx=40, pady=10)
+        
         self.tab_auto_container = tk.Frame(self.notebook, bg=COLOR_BORDER) 
         self.tab_manual_container = tk.Frame(self.notebook, bg=COLOR_BORDER) 
         self.tab_auto = tk.Frame(self.tab_auto_container, bg=COLOR_PANEL)
@@ -89,75 +84,42 @@ class LabApp:
         self.build_auto_tab()
         self.build_manual_tab()
 
-        self.log("System Ready. UI Initialized.")
+        self.log("System Ready. Connected directly to ROS 2 Network.")
 
-    # --- ROBOT COMMUNICATION LOGIC ---
-
-    def start_robot_process(self):
-        """Launches the C++ file in the background and listens to it."""
-        import time # Ensure time is imported
-        try:
-            self.robot_process = subprocess.Popen(
-                ROBOT_CMD,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
-            # Run a thread to echo the C++ prints to the terminal
-            threading.Thread(target=self.monitor_robot_output, daemon=True).start()
-
-            # --- NEW CRASH CATCHER ---
-            # Wait half a second to see if the launch command instantly fails
-            time.sleep(0.5)
-            if self.robot_process.poll() is not None:
-                # The process died. Grab the error output.
-                out, _ = self.robot_process.communicate()
-                print(f"\n[!!!] FATAL: Robot process crashed instantly (Exit Code: {self.robot_process.returncode})")
-                print(f"[!!!] BASH ERROR LOG:\n{out}")
-                
-        except Exception as e:
-            print(f"[-] ERROR STARTING ROBOT SCRIPT: {e}")
-            print(f"[-] ERROR STARTING ROBOT SCRIPT: {e}")
-
-    def monitor_robot_output(self):
-        """Constantly reads the stdout of the C++ script and prints it to your terminal."""
-        if self.robot_process:
-            for line in self.robot_process.stdout:
-                # Print directly to terminal so you see MoveIt planning outputs
-                sys.stdout.write(line)
-                sys.stdout.flush()
-
-    def send_command(self, cmd):
-        """Sends a single string command to the C++ std::cin pipe."""
-        if self.robot_process and self.robot_process.poll() is None:
-            self.robot_process.stdin.write(cmd + "\n")
-            self.robot_process.stdin.flush()
-        else:
-            print(f"[-] WARNING: Cannot send '{cmd}', robot script is not running.")
-
-    def queue_tube_sequence(self, marker_id):
-        """Generates and sends the pick, place, and pour sequence for a specific marker."""
-        commands = [
-            "o",               # Open Gripper
-            f"m {marker_id}",  # Go to the requested tube
-            "c",               # Close Gripper
-            "m 6",             # Go to Mix Tube
-            "p",               # Pour
-            f"m {marker_id}",  # Return tube to its original spot
-            "o"                # Open Gripper
-        ]
-        for cmd in commands:
-            self.send_command(cmd)
+    def on_close(self):
+        """Safely shuts down the ROS 2 node when the GUI is closed."""
+        self.log("Shutting down GUI Node...")
+        self.ros_node.destroy_node()
+        rclpy.shutdown()
+        self.root.destroy()
 
     def log(self, message):
         """Logs high-level Python events to your terminal."""
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        print(f"\n[{timestamp}] [GUI] {message}\n")
+        print(f"[{timestamp}] [GUI] {message}")
+
+    # --- THE MAGIC PIPELINE ---
+    def send_command(self, cmd):
+        """Publishes the command instantly as a native ROS 2 node."""
+        msg = String()
+        msg.data = str(cmd)
+        self.publisher.publish(msg)
+        self.log(f"Command fired -> {cmd}")
+
+    def queue_tube_sequence(self, marker_id):
+        """Sends the pick, place, and pour sequence step-by-step."""
+        # Using a slight delay thread so it doesn't slam the network all at once
+        def sequence():
+            import time
+            commands = ["o", f"m {marker_id}", "c", "m 6", "p", f"m {marker_id}", "o"]
+            for cmd in commands:
+                self.send_command(cmd)
+                # Give the C++ script a tiny moment to register each command
+                time.sleep(0.1) 
+                
+        threading.Thread(target=sequence, daemon=True).start()
 
     # --- AUTO MODE ---
-    
     def build_auto_tab(self):
         container = tk.Frame(self.tab_auto, bg=COLOR_PANEL)
         container.pack(expand=True, fill="both", pady=40)
@@ -173,45 +135,69 @@ class LabApp:
     def run_recipe(self, recipe_name):
         markers = RECIPES[recipe_name]
         self.log(f"Auto-Sequence Started: {recipe_name}")
-        
         for marker in markers:
-            self.log(f"Queuing sequence for Marker {marker}...")
             self.queue_tube_sequence(marker)
-            
-        self.log("All commands for recipe sent to robot buffer.")
 
     # --- MANUAL MODE ---
-    
     def build_manual_tab(self):
         main_frame = tk.Frame(self.tab_manual, bg=COLOR_PANEL)
-        main_frame.pack(fill="both", expand=True, padx=40, pady=30)
+        main_frame.pack(fill="both", expand=True, padx=40, pady=20)
 
-        controls_frame = tk.Frame(main_frame, bg=COLOR_PANEL)
+        # DIRECT OVERRIDE PANEL
+        override_frame = tk.LabelFrame(main_frame, text=" DIRECT ROBOT OVERRIDE ", 
+                                       bg=COLOR_PANEL, fg=COLOR_BLUE_NEON, font=("Arial", 14, "bold"), pady=15, padx=15)
+        override_frame.pack(fill="x", pady=(0, 20))
+
+        actions_frame = tk.Frame(override_frame, bg=COLOR_PANEL)
+        actions_frame.pack(pady=5)
+
+        tk.Button(actions_frame, text="OPEN GRIPPER", bg="#333", fg="white", width=15, font=("Arial", 12, "bold"), 
+                  command=lambda: self.send_command("o")).grid(row=0, column=0, padx=10)
+        tk.Button(actions_frame, text="CLOSE GRIPPER", bg="#333", fg="white", width=15, font=("Arial", 12, "bold"), 
+                  command=lambda: self.send_command("c")).grid(row=0, column=1, padx=10)
+        tk.Button(actions_frame, text="POUR LIQUID", bg="#333", fg="white", width=15, font=("Arial", 12, "bold"), 
+                  command=lambda: self.send_command("p")).grid(row=0, column=2, padx=10)
+        tk.Button(actions_frame, text="GO TO MIXER", bg="#333", fg="white", width=15, font=("Arial", 12, "bold"), 
+                  command=lambda: self.send_command("m 6")).grid(row=0, column=3, padx=10)
+
+        targets_frame = tk.Frame(override_frame, bg=COLOR_PANEL)
+        targets_frame.pack(pady=10)
+
+        for i in range(1, 6):
+            tk.Button(targets_frame, text=f"GO TO TUBE {i}", bg="#222", fg="white", width=12, font=("Arial", 10), 
+                      command=lambda m=i: self.send_command(f"m {m}")).grid(row=0, column=i-1, padx=5)
+
+        # MANUAL BATCH
+        batch_frame = tk.LabelFrame(main_frame, text=" MANUAL BATCH PROTOCOL ", 
+                                    bg=COLOR_PANEL, fg=COLOR_TEXT_DIM, font=("Arial", 14, "bold"), pady=15, padx=15)
+        batch_frame.pack(fill="both", expand=True)
+
+        controls_frame = tk.Frame(batch_frame, bg=COLOR_PANEL)
         controls_frame.pack()
 
         for i, (pump_id, chem_name) in enumerate(REAGENTS.items()):
             tk.Label(controls_frame, text=f"{pump_id} | {chem_name}", width=30, anchor="w", 
-                     bg=COLOR_PANEL, fg="#ccc", font=("Arial", 14)).grid(row=i, column=0, padx=15, pady=20)
+                     bg=COLOR_PANEL, fg="#ccc", font=("Arial", 14)).grid(row=i, column=0, padx=15, pady=10)
 
-            btn_add = tk.Button(controls_frame, text="ADD", bg="#333", fg="white", width=10, height=1, relief="flat",
+            btn_add = tk.Button(controls_frame, text="ADD TO SEQUENCE", bg="#333", fg="white", width=18, height=1, relief="flat",
                                 font=("Arial", 12, "bold"), 
                                 activebackground=COLOR_BLUE_NEON, activeforeground="black",
                                 command=lambda p=pump_id, n=chem_name: self.add_to_batch(p, n))
             btn_add.grid(row=i, column=1, padx=15)
 
-        self.batch_lbl = tk.Label(main_frame, text="BATCH: 0 ITEMS PENDING", font=("Arial", 18, "bold"), bg=COLOR_PANEL, fg=COLOR_TEXT_DIM)
-        self.batch_lbl.pack(pady=30)
+        self.batch_lbl = tk.Label(batch_frame, text="SEQUENCE: 0 ITEMS PENDING", font=("Arial", 16, "bold"), bg=COLOR_PANEL, fg=COLOR_TEXT_DIM)
+        self.batch_lbl.pack(pady=20)
 
-        btn_exec = tk.Button(main_frame, text="EXECUTE PROTOCOL", bg=COLOR_BLUE_DARK, fg="white", 
+        btn_exec = tk.Button(batch_frame, text="EXECUTE SEQUENCE", bg=COLOR_BLUE_DARK, fg="white", 
                              font=("Arial", 18, "bold"), width=35, height=2, relief="flat",
                              activebackground=COLOR_BLUE_NEON, activeforeground="black",
                              command=self.execute_batch)
-        btn_exec.pack(side="bottom", pady=20)
+        btn_exec.pack(side="bottom", pady=10)
 
     def add_to_batch(self, pump_id, name):
         self.manual_batch.append(pump_id)
-        self.log(f"Manual Added: {name} ({pump_id})")
-        self.batch_lbl.config(text=f"BATCH: {len(self.manual_batch)} ITEM(S) PENDING", fg="#00aaff")
+        self.log(f"Manual Added: {name}")
+        self.batch_lbl.config(text=f"SEQUENCE: {len(self.manual_batch)} ITEM(S) PENDING", fg="#00aaff")
 
     def execute_batch(self):
         if not self.manual_batch:
@@ -220,16 +206,11 @@ class LabApp:
 
         self.log("Starting Manual Dispense Protocol...")
         for tube_string in self.manual_batch:
-            # Extract the number from "Tube 1", "Tube 2", etc.
             marker_id = tube_string.split(" ")[1]
-            self.log(f"Queuing sequence for Marker {marker_id}...")
             self.queue_tube_sequence(marker_id)
             
-        self.log("Manual Protocol commands sent to robot buffer.")
-        
-        # Reset batch
         self.manual_batch.clear()
-        self.batch_lbl.config(text="BATCH: 0 ITEMS PENDING", fg=COLOR_TEXT_DIM)
+        self.batch_lbl.config(text="SEQUENCE: 0 ITEMS PENDING", fg=COLOR_TEXT_DIM)
 
 if __name__ == "__main__":
     root = tk.Tk()
