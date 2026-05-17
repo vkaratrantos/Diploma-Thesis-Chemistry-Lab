@@ -33,7 +33,7 @@ static constexpr double VEL_SCALE_TRANSIT  = 0.9;
 static constexpr double VEL_SCALE_LIQUID   = 0.8; 
 static constexpr double ACC_SCALE_TRANSIT  = 0.80;
 static constexpr double ACC_SCALE_LIQUID   = 0.60;
-static constexpr double CARTESIAN_EEF_STEP = 0.005; 
+static constexpr double CARTESIAN_EEF_STEP = 0.015; 
 static constexpr double CARTESIAN_JUMP_THR = 2.0;   
 static constexpr double MIN_CARTESIAN_FRACTION = 0.95; 
 
@@ -447,7 +447,7 @@ int main(int argc, char * argv[])
                         if (marker_id == 1) { tx = -0.15; ty = -0.15; tz = 0.1; } 
                         else if (marker_id == 2) { tx = -0.05; ty = -0.20; tz = 0.12; } 
                         else if (marker_id == 3) { tx = 0.00; ty = -0.22; tz = 0.11; } 
-                        else if (marker_id == 4) { tx = 0.05; ty = -0.16; tz = 0.12; } 
+                        else if (marker_id == 4) { tx = 0.1; ty = -0.19; tz = 0.12; } 
                         else if (marker_id == 5) { tx = 0.15; ty = -0.15; tz = 0.12; } 
                         else if (marker_id == 6) { tx = -0.2; ty = -0.1; tz = 0.12; } 
                         else {
@@ -557,8 +557,8 @@ int main(int argc, char * argv[])
             ocm.orientation.z = q_upright.z();
             ocm.orientation.w = q_upright.w();
             ocm.absolute_x_axis_tolerance = 3.14; 
-            ocm.absolute_y_axis_tolerance = 0.2;
-            ocm.absolute_z_axis_tolerance = 0.2; 
+            ocm.absolute_y_axis_tolerance = 0.25;
+            ocm.absolute_z_axis_tolerance = 0.25; 
             ocm.weight = 1.0;
 
             moveit_msgs::msg::Constraints path_constraints;
