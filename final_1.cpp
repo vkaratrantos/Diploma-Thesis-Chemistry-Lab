@@ -29,10 +29,10 @@
 
 // CONSTANTS
 
-static constexpr double VEL_SCALE_TRANSIT  = 0.9; 
-static constexpr double VEL_SCALE_LIQUID   = 0.8; 
-static constexpr double ACC_SCALE_TRANSIT  = 0.80;
-static constexpr double ACC_SCALE_LIQUID   = 0.60;
+static constexpr double VEL_SCALE_TRANSIT  = 0.3; 
+static constexpr double VEL_SCALE_LIQUID   = 0.3; 
+static constexpr double ACC_SCALE_TRANSIT  = 0.1;
+static constexpr double ACC_SCALE_LIQUID   = 0.1;
 static constexpr double CARTESIAN_EEF_STEP = 0.015; 
 static constexpr double CARTESIAN_JUMP_THR = 2.0;   
 static constexpr double MIN_CARTESIAN_FRACTION = 0.95; 
@@ -81,7 +81,7 @@ void setupCollisionObjects(const std::string& frame_id) {
     wall.primitives[0].dimensions = {
         0.4 - (-0.4),        
         0.20 - 0,
-        0.1 - 0.0
+        0.3 - 0.0
     };
     
     wall.primitive_poses.resize(1);
@@ -103,7 +103,7 @@ void setupCollisionObjects(const std::string& frame_id) {
     wall2.primitives[0].dimensions = {
         0.2 - 0.0,        
         0.4 - 0.0,
-        0.3 - 0.0
+        0.15 - 0.0
     };
     
     wall2.primitive_poses.resize(1);
@@ -131,21 +131,29 @@ bool strictCartesianMove(
     const geometry_msgs::msg::Pose                 & target,
     const std::string                              & phase_name)
 {
-    std::vector<geometry_msgs::msg::Pose> waypoints = {target};
-    moveit_msgs::msg::RobotTrajectory trajectory;
+    std::cout << "    [" << phase_name << "] Planning Pilz LIN (Linear) trajectory...\n";
 
-    double fraction = iface.computeCartesianPath(
-        waypoints, CARTESIAN_EEF_STEP, CARTESIAN_JUMP_THR, trajectory);
+    // 1. Switch to the Pilz Pipeline
+    iface.setPlanningPipelineId("pilz_industrial_motion_planner");
+    
+    // 2. Set the Planner to LIN (Linear Cartesian)
+    // Note: You could also use "PTP" (Point-To-Point) for fast joint-space moves
+    iface.setPlannerId("LIN");
+    
+    // 3. Set the target
+    iface.setPoseTarget(target);
 
-    if (fraction >= MIN_CARTESIAN_FRACTION) {
-        std::cout << "    [" << phase_name << "] Cartesian path: "
-                  << static_cast<int>(fraction * 100) << "% complete. Executing...\n";
-        auto result = iface.execute(trajectory);
-        return (result == moveit::core::MoveItErrorCode::SUCCESS);
+    // 4. Plan the trajectory
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    auto success = iface.plan(plan);
+
+    if (success == moveit::core::MoveItErrorCode::SUCCESS) {
+        std::cout << "    [+] LIN path found. Executing...\n";
+        auto exec_result = iface.execute(plan);
+        return (exec_result == moveit::core::MoveItErrorCode::SUCCESS);
     } 
     
-    std::cout << "[-] [" << phase_name << "] Cartesian coverage too low ("
-              << static_cast<int>(fraction * 100) << "%). Aborting to prevent spilling.\n";
+    std::cout << "    [-] LIN path failed (Likely singularity or collision).\n";
     return false;
 }
 
@@ -165,7 +173,7 @@ bool smartVerticalDrop(
 
     std::cout << "    [-] Direct drop blocked. Using 2-Stage Approach & Insert...\n";
 
-    double approach_z = target_z + 0.05; 
+    double approach_z = target_z + 0.08; 
     if (start_pose.position.z <= approach_z) {
         std::cout << "    [-] Arm is already too low for a 2-stage drop.\n";
         return false;
@@ -233,7 +241,7 @@ bool smartVerticalLift(
     }
 
     std::cout << "    [-] Direct lift blocked. Using 2-Stage Extraction & Ascent...\n";
-    double extraction_z = start_pose.position.z + 0.05; 
+    double extraction_z = start_pose.position.z + 0.08; 
     if (extraction_z >= safe_z_target) {
         return false;
     }
@@ -476,7 +484,7 @@ int main(int argc, char * argv[])
             continue;
         }
 
-        // --- [PHASE 2] OPTIMIZED HORIZONTAL MOVE ---
+        // --- [PHASE 2] HYBRID HORIZONTAL MOVE (Pilz -> OMPL) ---
         std::cout << "\n--- [PHASE 2] HORIZONTAL MOVE to (" << tx << ", " << ty << ") ---\n";
 
         arm_interface.setStartStateToCurrentState();
@@ -490,65 +498,25 @@ int main(int argc, char * argv[])
 
         bool moved = false;
 
+        // 1. PRIMARY ATTEMPT: Pilz LIN (Instant & Deterministic)
+        std::cout << "    [!] Attempting strict Cartesian straight line (Pilz LIN)...\n";
+        
         if (strictCartesianMove(arm_interface, target_pose, "HORIZ_DIRECT")) {
             waitForStateSettle(arm_interface);
             moved = true;
-        } else {
-            std::cout << "    [-] Direct path blocked. Running Virtual Look-Ahead for detours...\n";
-
-            double dx = tx - start_pose.position.x;
-            double dy = ty - start_pose.position.y;
-            double mid_x = start_pose.position.x + (dx / 2.0);
-            double mid_y = start_pose.position.y + (dy / 2.0);
-            double perp_x = -dy; 
-            double perp_y = dx;
-            double mag = std::sqrt(perp_x * perp_x + perp_y * perp_y);
-            perp_x /= mag; perp_y /= mag;
-
-            std::vector<double> offsets = {0.01, -0.01, 0.02, -0.02, 0.03, -0.03, 0.04, -0.04, 0.05, -0.05, 0.06, -0.06, 0.07, -0.07, 0.08, -0.08, 0.09, -0.09, 0.1, -0.1, 0.11, -0.11, 0.12, -0.12, 0.13, -0.13, 0.14, -0.14, 0.15, -0.15, 0.16, -0.16, 0.17, -0.17, 0.18, -0.18, 0.19, -0.19, 0.2, -0.2, 0.21, -0.21, 0.22, -0.22, 0.23, -0.23};
-
-            for (double offset : offsets) {
-                geometry_msgs::msg::Pose detour_pose = start_pose;
-                detour_pose.position.x = mid_x + (perp_x * offset);
-                detour_pose.position.y = mid_y + (perp_y * offset);
-                detour_pose.position.z = SAFE_Z_TARGET; // Lock Z here too
-
-                moveit_msgs::msg::RobotTrajectory traj1;
-                std::vector<geometry_msgs::msg::Pose> way1 = {detour_pose};
-                double frac1 = arm_interface.computeCartesianPath(way1, CARTESIAN_EEF_STEP, CARTESIAN_JUMP_THR, traj1);
-
-                if (frac1 >= MIN_CARTESIAN_FRACTION) {
-                    moveit::core::RobotState temp_state(*arm_interface.getCurrentState());
-                    temp_state.setJointGroupPositions("arm_group", traj1.joint_trajectory.points.back().positions);
-                    
-                    arm_interface.setStartState(temp_state); 
-                    moveit_msgs::msg::RobotTrajectory traj2;
-                    std::vector<geometry_msgs::msg::Pose> way2 = {target_pose};
-                    double frac2 = arm_interface.computeCartesianPath(way2, CARTESIAN_EEF_STEP, CARTESIAN_JUMP_THR, traj2);
-
-                    if (frac2 >= MIN_CARTESIAN_FRACTION) {
-                        std::cout << "    [+] Valid Detour Found. Executing...\n";
-                        arm_interface.setStartStateToCurrentState(); 
-                        arm_interface.execute(traj1);
-                        waitForStateSettle(arm_interface);
-                        arm_interface.execute(traj2);
-                        waitForStateSettle(arm_interface);
-                        moved = true;
-                        break;
-                    }
-                }
-                arm_interface.setStartStateToCurrentState();
-            }
-        }
-
-        if (!moved) {
-            std::cout << "    [-] Cartesian detours failed. Attempting constrained OMPL fallback...\n";
+        } 
+        // 2. FALLBACK ATTEMPT: OMPL (Probabilistic Detour)
+        else {
+            std::cout << "    [-] Pilz straight line blocked (obstacle or singularity).\n";
+            std::cout << "    [!] Falling back to constrained OMPL search (5.0s timeout)...\n";
+            
             arm_interface.setStartStateToCurrentState();
             arm_interface.setPlanningPipelineId("ompl");
             arm_interface.setPlannerId("RRTConnectkConfigDefault");
-            arm_interface.setPlanningTime(5.0);
+            arm_interface.setPlanningTime(5.0); // The 5 seconds belongs here
             arm_interface.setPoseTarget(target_pose);
 
+            // Define Strict Upright Constraints
             moveit_msgs::msg::OrientationConstraint ocm;
             ocm.link_name = arm_interface.getEndEffectorLink();
             ocm.header.frame_id = arm_interface.getPlanningFrame();
@@ -556,28 +524,34 @@ int main(int argc, char * argv[])
             ocm.orientation.y = q_upright.y();
             ocm.orientation.z = q_upright.z();
             ocm.orientation.w = q_upright.w();
-            ocm.absolute_x_axis_tolerance = 3.14; 
-            ocm.absolute_y_axis_tolerance = 0.25;
-            ocm.absolute_z_axis_tolerance = 0.25; 
+            ocm.absolute_x_axis_tolerance = 3.14; // Free yaw (rotation around Z-axis)
+            ocm.absolute_y_axis_tolerance = 0.25; // Strict Pitch
+            ocm.absolute_z_axis_tolerance = 0.25; // Strict Roll
             ocm.weight = 1.0;
 
             moveit_msgs::msg::Constraints path_constraints;
             path_constraints.orientation_constraints.push_back(ocm);
             arm_interface.setPathConstraints(path_constraints);
 
+            // Plan and Execute
             moveit::planning_interface::MoveGroupInterface::Plan plan;
             if (arm_interface.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                std::cout << "    [+] Valid OMPL detour found. Executing...\n";
                 if (arm_interface.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS) {
                     waitForStateSettle(arm_interface);
                     moved = true;
                 }
+            } else {
+                std::cout << "    [-] OMPL failed to find a valid constrained path.\n";
             }
+            
+            // ALWAYS clear constraints, success or fail
             arm_interface.clearPathConstraints();
         }
 
         if (!moved) {
             std::cout << "[-] [PHASE 2] Target unreachable upright.\n";
-            continue;
+            continue; // Abort and wait for next command
         }
         
         // PHASE 3: DROP
