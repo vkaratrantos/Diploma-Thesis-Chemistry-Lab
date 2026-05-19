@@ -29,10 +29,10 @@
 
 // CONSTANTS
 
-static constexpr double VEL_SCALE_TRANSIT  = 0.9; 
-static constexpr double VEL_SCALE_LIQUID   = 0.8; 
-static constexpr double ACC_SCALE_TRANSIT  = 0.80;
-static constexpr double ACC_SCALE_LIQUID   = 0.60;
+static constexpr double VEL_SCALE_TRANSIT  = 0.3; 
+static constexpr double VEL_SCALE_LIQUID   = 0.3; 
+static constexpr double ACC_SCALE_TRANSIT  = 0.1;
+static constexpr double ACC_SCALE_LIQUID   = 0.1;
 static constexpr double CARTESIAN_EEF_STEP = 0.015; 
 static constexpr double CARTESIAN_JUMP_THR = 2.0;   
 static constexpr double MIN_CARTESIAN_FRACTION = 0.95; 
@@ -131,21 +131,29 @@ bool strictCartesianMove(
     const geometry_msgs::msg::Pose                 & target,
     const std::string                              & phase_name)
 {
-    std::vector<geometry_msgs::msg::Pose> waypoints = {target};
-    moveit_msgs::msg::RobotTrajectory trajectory;
+    std::cout << "    [" << phase_name << "] Planning Pilz LIN (Linear) trajectory...\n";
 
-    double fraction = iface.computeCartesianPath(
-        waypoints, CARTESIAN_EEF_STEP, CARTESIAN_JUMP_THR, trajectory);
+    // 1. Switch to the Pilz Pipeline
+    iface.setPlanningPipelineId("pilz_industrial_motion_planner");
+    
+    // 2. Set the Planner to LIN (Linear Cartesian)
+    // Note: You could also use "PTP" (Point-To-Point) for fast joint-space moves
+    iface.setPlannerId("LIN");
+    
+    // 3. Set the target
+    iface.setPoseTarget(target);
 
-    if (fraction >= MIN_CARTESIAN_FRACTION) {
-        std::cout << "    [" << phase_name << "] Cartesian path: "
-                  << static_cast<int>(fraction * 100) << "% complete. Executing...\n";
-        auto result = iface.execute(trajectory);
-        return (result == moveit::core::MoveItErrorCode::SUCCESS);
+    // 4. Plan the trajectory
+    moveit::planning_interface::MoveGroupInterface::Plan plan;
+    auto success = iface.plan(plan);
+
+    if (success == moveit::core::MoveItErrorCode::SUCCESS) {
+        std::cout << "    [+] LIN path found. Executing...\n";
+        auto exec_result = iface.execute(plan);
+        return (exec_result == moveit::core::MoveItErrorCode::SUCCESS);
     } 
     
-    std::cout << "[-] [" << phase_name << "] Cartesian coverage too low ("
-              << static_cast<int>(fraction * 100) << "%). Aborting to prevent spilling.\n";
+    std::cout << "    [-] LIN path failed (Likely singularity or collision).\n";
     return false;
 }
 
