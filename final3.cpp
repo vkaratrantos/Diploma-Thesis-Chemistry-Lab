@@ -190,8 +190,8 @@ bool smartVerticalDrop(
     ocm.orientation.z = q_upright.z();
     ocm.orientation.w = q_upright.w();
     ocm.absolute_x_axis_tolerance = 3.14; 
-    ocm.absolute_y_axis_tolerance = 0.2;
-    ocm.absolute_z_axis_tolerance = 0.2; 
+    ocm.absolute_y_axis_tolerance = 0.35;
+    ocm.absolute_z_axis_tolerance = 0.35; 
     ocm.weight = 1.0;
 
     moveit_msgs::msg::Constraints path_constraints;
@@ -266,8 +266,8 @@ bool smartVerticalLift(
     ocm.orientation.z = q_upright.z();
     ocm.orientation.w = q_upright.w();
     ocm.absolute_x_axis_tolerance = 3.14; 
-    ocm.absolute_y_axis_tolerance = 0.25;
-    ocm.absolute_z_axis_tolerance = 0.25; 
+    ocm.absolute_y_axis_tolerance = 0.35;
+    ocm.absolute_z_axis_tolerance = 0.35; 
     ocm.weight = 1.0;
 
     moveit_msgs::msg::Constraints path_constraints;
@@ -324,7 +324,7 @@ int main(int argc, char * argv[])
     arm_interface.setPlannerId("RRTConnectkConfigDefault");
     arm_interface.setPlanningTime(5.0);
     arm_interface.setGoalPositionTolerance(0.01);
-    arm_interface.setGoalOrientationTolerance(0.05);
+    arm_interface.setGoalOrientationTolerance(0.1);
 
     geometry_msgs::msg::Pose start_pose;
     start_pose.position.x    = -0.15;
@@ -514,8 +514,8 @@ int main(int argc, char * argv[])
             ocm.orientation.z = q_upright.z();
             ocm.orientation.w = q_upright.w();
             ocm.absolute_x_axis_tolerance = 3.14; 
-            ocm.absolute_y_axis_tolerance = 0.25; 
-            ocm.absolute_z_axis_tolerance = 0.25; 
+            ocm.absolute_y_axis_tolerance = 0.35; 
+            ocm.absolute_z_axis_tolerance = 0.35; 
             ocm.weight = 1.0;
 
             moveit_msgs::msg::Constraints path_constraints;
