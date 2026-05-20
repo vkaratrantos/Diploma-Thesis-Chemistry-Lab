@@ -1,0 +1,17 @@
+# stomp_planning.yaml
+
+stomp:
+  # 3 = Use the trajectory from the previous planner (OMPL) as the seed
+  initialization_method: 3 
+  num_timesteps: 60           
+  num_iterations: 60          
+  num_iterations_after_valid: 0
+  num_rollouts: 15            
+  max_rollouts: 15
+  
+  # Penalize high accelerations/jerks to keep the liquid steady
+  control_cost_weight: 0.8    
+  
+  # Enforce your moveit_msgs::msg::OrientationConstraint
+  validity_system:
+    name: stomp_moveit/AlwaysValidSystem
