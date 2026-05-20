@@ -62,10 +62,16 @@ def generate_launch_description():
     }
 
     # =========================================================================
-    # 3. Load Planning Pipelines (OMPL & Pilz)
+    # 3. Load Planning Pipelines (OMPL, Pilz, & STOMP)
     # =========================================================================
     ompl_planning_yaml = load_yaml(moveit_config_pkg, 'config/ompl_planning.yaml')
     
+    # [NEW] Φορτώνουμε το νέο Hybrid Pipeline (OMPL + STOMP)
+    ompl_stomp_planning_yaml = load_yaml(moveit_config_pkg, 'config/ompl_stomp_planning.yaml')
+    
+    # [NEW] Φορτώνουμε τους κανόνες αξιολόγησης του STOMP
+    stomp_config_yaml = load_yaml(moveit_config_pkg, 'config/stomp_planning.yaml')
+
     # [ΝΕΟ] Ορίζουμε τον Pilz απευθείας στο Python (διορθωμένο για ROS 2)
     pilz_config = {
         'planning_plugin': 'pilz_industrial_motion_planner/CommandPlanner',
@@ -77,10 +83,13 @@ def generate_launch_description():
     }
 
     pipeline_config = {
-        'planning_pipelines': ['ompl', 'pilz_industrial_motion_planner'],
+        # [ΑΛΛΑΓΗ] Προσθέσαμε το 'ompl_stomp' στη λίστα των ενεργών pipelines
+        'planning_pipelines': ['ompl', 'pilz_industrial_motion_planner', 'ompl_stomp'],
         'default_planning_pipeline': 'ompl',
         'ompl': ompl_planning_yaml,
-        'pilz_industrial_motion_planner': pilz_config
+        'pilz_industrial_motion_planner': pilz_config,
+        # [ΑΛΛΑΓΗ] Ενώνουμε το νέο yaml με το όνομα του pipeline
+        'ompl_stomp': ompl_stomp_planning_yaml 
     }
 
     # =========================================================================
@@ -141,8 +150,7 @@ def generate_launch_description():
         name='anchor_tf',
         arguments=['0.0', '-0.06', '0.0', '0.0', '0.0', '0.0', 'world', 'marker_base']
     )
-
-    # Move Group Node
+    
     # Move Group Node
     run_move_group_node = Node(
         package='moveit_ros_move_group',
@@ -156,6 +164,7 @@ def generate_launch_description():
             pipeline_config,         
             trajectory_execution,
             moveit_controllers, 
+            stomp_config_yaml,                  # <-- [ΝΕΟ] Περνάμε τις παραμέτρους του STOMP
             {'use_sim_time': False},
         ],
     )
