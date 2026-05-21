@@ -14,7 +14,7 @@ class ArucoAnchor(Node):
         self.get_logger().info("--- Dynamic Camera System Started (With Memory) ---")
 
         # --- ΡΥΘΜΙΣΕΙΣ ---
-        self.ANCHOR_ID = 0      
+        self.ANCHOR_ID = 1
         self.MARKER_SIZE = 0.03 
         
         # --- ΝΕΟ: ΜΝΗΜΗ ΤΩΝ MARKERS ---
@@ -37,7 +37,11 @@ class ArucoAnchor(Node):
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.parameters = cv2.aruco.DetectorParameters()
 
-        self.cap = cv2.VideoCapture(1) 
+        self.cap = cv2.VideoCapture(0)
+        
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        
         self.tf_broadcaster = TransformBroadcaster(self)
         self.timer = self.create_timer(0.05, self.loop)
 
