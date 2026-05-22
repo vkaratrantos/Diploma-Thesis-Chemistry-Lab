@@ -85,19 +85,39 @@ class MoveItBridge(Node):
 
     def arm_callback(self, goal_handle):
         points = goal_handle.request.trajectory.points
+        if not points:
+            goal_handle.succeed()
+            return FollowJointTrajectory.Result()
+
         start_time = time.time()
         
         for point in points:
-            for i in range(7):
-                self.current_pos[i] = point.positions[i]
-            
+            target_positions = point.positions[:7]
             time_from_start = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
-            elapsed = time.time() - start_time
-            sleep_time = time_from_start - elapsed
+            target_time = start_time + time_from_start
             
-            # Because of Multi-Threading, this sleep NO LONGER blocks the publish_loop!
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            # Get starting positions for this specific movement segment
+            start_positions = list(self.current_pos[:7])
+            
+            # --- THE FIX: Linear Interpolation Loop ---
+            now = time.time()
+            segment_duration = target_time - now
+            
+            # If the waypoint is more than 0.02s away, slice it up!
+            if segment_duration > 0.02:
+                steps = int(segment_duration / 0.02)
+                for step in range(1, steps + 1):
+                    fraction = step / float(steps)
+                    for i in range(7):
+                        self.current_pos[i] = start_positions[i] + fraction * (target_positions[i] - start_positions[i])
+                    time.sleep(0.02)
+            else:
+                # If it's a tiny Cartesian step, just sleep the remainder
+                time.sleep(max(0.0, segment_duration))
+            
+            # Ensure it snaps perfectly to the target at the very end of the waypoint
+            for i in range(7):
+                self.current_pos[i] = target_positions[i]
 
         goal_handle.succeed()
         return FollowJointTrajectory.Result()
