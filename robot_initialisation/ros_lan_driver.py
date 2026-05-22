@@ -37,7 +37,7 @@ class LanDriver(Node):
         # 3. Subscriber
         self.subscription = self.create_subscription(
             JointState,
-            'joint_states',
+            '/hardware_joints',
             self.listener_callback,
             10)
         
@@ -70,7 +70,7 @@ class LanDriver(Node):
             
             # Στέλνουμε εντολή μόνο αν βρήκαμε και τα 7 joints
             if found_all and len(arm_angles) == 7:
-                self.mc.send_radians(arm_angles, 25)
+                self.mc.send_radians(arm_angles, 100)
 
             # --- Β. GRIPPER (ΔΙΟΡΘΩΣΗ ΦΟΡΑΣ) ---
             if 'endeffector_gripper' in msg.name:
