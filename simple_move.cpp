@@ -1,6 +1,4 @@
-// =============================================================================
-// simple_move.cpp — Liquid Handler Pick & Place (Fixed Cartesian Wrapper)
-// =============================================================================
+// Liquid Handling Robotic System
 
 #include <memory>
 #include <thread>
@@ -31,6 +29,7 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 
 // CONSTANTS
+
 static constexpr double VEL_SCALE_TRANSIT  = 0.3; 
 static constexpr double VEL_SCALE_LIQUID   = 0.3; 
 static constexpr double ACC_SCALE_TRANSIT  = 0.1;
@@ -39,22 +38,27 @@ static constexpr double CARTESIAN_EEF_STEP = 0.005;
 static constexpr double MIN_CARTESIAN_FRACTION = 0.8;
 static constexpr double JUMP_THRESHOLD     = 1.5;
 
-// Fixed Standard Lift Height for 7-DOF myArm 300 Pi
-static constexpr double SAFE_Z_TARGET      = 0.28;  
+// MOTION VARIABLES
 
-// Drop Retry Constants 
+static constexpr double SAFE_Z_TARGET      = 0.28;  
 static constexpr double DROP_Z_RETRY_STEP  = 0.005;  
 static constexpr double DROP_Z_MAX_RETRY   = 0.08;  
 static constexpr int    STATE_SETTLE_MS    = 500;   
 
-// --- QUEUE SYSTEM ---
+// QUEUE
+
 std::queue<std::string> command_queue;
 std::mutex queue_mutex;
 
+// COLLISION OBJECTS
+
 void setupCollisionObjects(const std::string& frame_id) {
+
     moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
     std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
 
+    // TABLE SURFACE COLLISION OBJECT
+    
     moveit_msgs::msg::CollisionObject table;
     table.id = "table_base";
     table.header.frame_id = frame_id;
@@ -69,6 +73,8 @@ void setupCollisionObjects(const std::string& frame_id) {
     table.operation = table.ADD;
     collision_objects.push_back(table);
 
+    // 1ST BOX OBJECT
+    
     moveit_msgs::msg::CollisionObject wall;
     wall.id = "obstacle_box";
     wall.header.frame_id = frame_id;
@@ -82,6 +88,8 @@ void setupCollisionObjects(const std::string& frame_id) {
     wall.primitive_poses[0].orientation.w = 1.0;
     wall.operation = wall.ADD;
     collision_objects.push_back(wall);
+
+    // 2ND BOX OBJECT
     
     moveit_msgs::msg::CollisionObject wall2;
     wall2.id = "obstacle_box_2";
@@ -109,9 +117,8 @@ void waitForStateSettle(
     iface.startStateMonitor(1.0); 
 }
 
-// =====================================================================================
-// NATIVE CARTESIAN WRAPPER (Fixes Deadlock & Velocity Issues)
-// =====================================================================================
+// CARTESIAN MOVES FUNCTION
+
 bool computeCartesianMove(
     moveit::planning_interface::MoveGroupInterface & iface,
     const geometry_msgs::msg::Pose & target_pose,
@@ -124,35 +131,28 @@ bool computeCartesianMove(
 
     moveit_msgs::msg::RobotTrajectory trajectory;
     
-    // 1. Calculate the raw geometric path
+    // 1. CALCULATION OF THE GEOMETRIC PATH
+    
     double fraction = iface.computeCartesianPath(waypoints, CARTESIAN_EEF_STEP, JUMP_THRESHOLD, trajectory);
 
-    if (fraction >= MIN_CARTESIAN_FRACTION) { 
-        // 2. FIX: Manually apply velocity and acceleration limits to the Cartesian path
+    if (fraction >= MIN_CARTESIAN_FRACTION) {
+        
         robot_trajectory::RobotTrajectory rt(iface.getRobotModel(), iface.getName());
         rt.setRobotTrajectoryMsg(*iface.getCurrentState(), trajectory);
-        
         trajectory_processing::TimeOptimalTrajectoryGeneration totg;
-        // This forces the path to obey your 0.3 velocity and 0.1 acceleration limits
-        totg.computeTimeStamps(rt, VEL_SCALE_LIQUID, ACC_SCALE_LIQUID);
-        
+        totg.computeTimeStamps(rt, VEL_SCALE_LIQUID, ACC_SCALE_LIQUID);        
         rt.getRobotTrajectoryMsg(trajectory); // Save the smoothed path back
-
         std::cout << "    [+] Cartesian path found and smoothed (" << (fraction * 100.0) << "%). Executing...\n";
-        
         moveit::planning_interface::MoveGroupInterface::Plan plan;
         plan.trajectory_ = trajectory;
-        
         return (iface.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS);
     } 
-
-    std::cout << "    [-] Cartesian path failed early at " << (fraction * 100.0) << "%. Collision detected.\n";
+    std::cout << "    [-] Cartesian path failed at " << (fraction * 100.0) << "%. Collision detected.\n";
     return false;
 }
 
-// =====================================================================================
-// HELPER: 2-Stage Smart Drop
-// =====================================================================================
+// SMART DROP FUNCTION
+
 bool smartVerticalDrop(
     moveit::planning_interface::MoveGroupInterface & iface,
     double target_z,
@@ -167,16 +167,16 @@ bool smartVerticalDrop(
         return true;
     }
 
-    // =========================================================================
-    // ATTEMPT 1: Pure Cartesian (Strictly Vertical)
-    // =========================================================================
+    // 1. CARTESIAN (VERTICAL DROP)
+
     if (computeCartesianMove(iface, final_pose, "DROP_DIRECT")) {
         waitForStateSettle(iface);
         return true;
     }
     std::cout << "    [-] Direct drop blocked.\n";
 
-    // --- Pre-configure base OMPL settings for the subsequent fallbacks ---
+    // OMPL SETTINGS
+    
     iface.setPlanningPipelineId("ompl");
     iface.setPlannerId("RRTConnectkConfigDefault");
     iface.setPlanningTime(10.0);
@@ -190,12 +190,12 @@ bool smartVerticalDrop(
     base_ocm.orientation.w = q_upright.w();
     base_ocm.weight = 1.0;
 
-    // =========================================================================
-    // ATTEMPT 2: Hybrid (OMPL to Approach Z -> Cartesian Insert)
-    // =========================================================================
+    // 2. HYBRID MOVEMENT (OMPL to APPROACH_Z AND CARTESIAN TO TARGET_Z)
+
     double approach_z = target_z + 0.08; 
     
-    // Only attempt the hybrid approach if we are currently higher than the approach height
+    // ATTEMPT THE HYBRID MOTION ONLY IF WE ARE ABOVE THE APPROACH HEIGHT
+    
     if (start_pose.position.z > approach_z) {
         std::cout << "    [-] Attempting Hybrid: OMPL Approach -> Cartesian Insert...\n";
         
@@ -216,7 +216,6 @@ bool smartVerticalDrop(
 
         if (iface.plan(hybrid_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
             
-            // Apply TOTG smoothing
             robot_trajectory::RobotTrajectory rt(iface.getRobotModel(), iface.getName());
             rt.setRobotTrajectoryMsg(*iface.getCurrentState(), hybrid_plan.trajectory_);
             trajectory_processing::TimeOptimalTrajectoryGeneration totg;
@@ -228,6 +227,7 @@ bool smartVerticalDrop(
                 waitForStateSettle(iface);
             }
         }
+        
         iface.clearPathConstraints();
 
         if (approach_success) {
@@ -247,12 +247,11 @@ bool smartVerticalDrop(
         std::cout << "    [-] Arm already below approach threshold. Skipping Hybrid phase.\n";
     }
 
-    // =========================================================================
-    // ATTEMPT 3: Pure Global OMPL (Strict)
-    // =========================================================================
+    // 3. OMPL MOTION DIRECTLY TO TARGET_Z WITH STRICT CONSTRAINTS
+
     std::cout << "    [-] Attempting Pure Constrained OMPL directly to target Z...\n";
     iface.setStartStateToCurrentState();
-    iface.setPoseTarget(final_pose); // Target is now the final bottom pose
+    iface.setPoseTarget(final_pose);
     
     base_ocm.absolute_x_axis_tolerance = M_PI; 
     base_ocm.absolute_y_axis_tolerance = 0.4;
@@ -279,14 +278,14 @@ bool smartVerticalDrop(
     }
     iface.clearPathConstraints();
 
-    // =========================================================================
-    // ATTEMPT 4: Relaxed OMPL (Allow slight tilting)
-    // =========================================================================
-    std::cout << "    [-] Strict OMPL failed. Relaxing constraints (allowing slight tilt)...\n";
+    // 4. OMPL MOTION DIRECTLY TO TARGET_Z WITH RELAXED CONSTRAINTS
+
+    std::cout << "    [-] Strict OMPL failed. Relaxing constraints...\n";
     iface.setStartStateToCurrentState();
     iface.setPoseTarget(final_pose);
     
-    // Relax constraints to ~45 degrees to bypass singularities
+    // RELAXED CONSTRAINTS
+    
     base_ocm.absolute_x_axis_tolerance = M_PI; 
     base_ocm.absolute_y_axis_tolerance = 0.8;
     base_ocm.absolute_z_axis_tolerance = 0.8; 
@@ -313,16 +312,14 @@ bool smartVerticalDrop(
     }
     iface.clearPathConstraints();
 
-    // =========================================================================
-    // ATTEMPT 5: Abort
-    // =========================================================================
+    // 5. ABORT
+
     std::cout << "    [!] CRITICAL: All drop attempts failed. Cannot reach target Z.\n";
     return false;
 }
 
-// =====================================================================================
-// HELPER: 2-Stage Smart Lift
-// =====================================================================================
+// SMART LIFT FUNCTION
+
 bool smartVerticalLift(
     moveit::planning_interface::MoveGroupInterface & iface,
     double safe_z_target,
@@ -334,16 +331,16 @@ bool smartVerticalLift(
 
     if (start_pose.position.z >= safe_z_target) return true;
 
-    // =========================================================================
-    // ATTEMPT 1: Pure Cartesian (Strictly Vertical)
-    // =========================================================================
+    // 1. CARTESIAN (VERTICAL LIFT)
+
     if (computeCartesianMove(iface, final_pose, "LIFT_DIRECT")) {
         waitForStateSettle(iface);
         return true;
     }
     std::cout << "    [-] Direct lift blocked.\n";
 
-    // --- Pre-configure base OMPL settings for the subsequent fallbacks ---
+    // OMPL SETTINGS
+    
     iface.setPlanningPipelineId("ompl");
     iface.setPlannerId("RRTConnectkConfigDefault");
     iface.setPlanningTime(10.0);
@@ -358,12 +355,11 @@ bool smartVerticalLift(
     base_ocm.orientation.w = q_upright.w();
     base_ocm.weight = 1.0;
 
-    // =========================================================================
-    // ATTEMPT 2: Hybrid (Partial Cartesian Extraction -> Strict OMPL Ascent)
-    // =========================================================================
+    // 2. HYBRID MOVEMENT (CARTESIAN TO EXTRACTION_Z AND OMPL TO SAFE_Z)
+
     double extraction_z = start_pose.position.z + 0.08; 
     if (extraction_z > safe_z_target) {
-        extraction_z = safe_z_target; // FIX: Clamp to prevent false failures
+        extraction_z = safe_z_target;
     }
 
     geometry_msgs::msg::Pose extraction_pose = start_pose;
@@ -373,7 +369,6 @@ bool smartVerticalLift(
         std::cout << "    [+] Extraction reached. Executing final constrained ascent...\n";
         iface.setStartStateToCurrentState();
         
-        // Tight tolerances on pitch/roll, allow yaw (spin)
         base_ocm.absolute_x_axis_tolerance = M_PI; 
         base_ocm.absolute_y_axis_tolerance = 0.4;
         base_ocm.absolute_z_axis_tolerance = 0.4; 
@@ -385,7 +380,6 @@ bool smartVerticalLift(
         moveit::planning_interface::MoveGroupInterface::Plan hybrid_plan;
         if (iface.plan(hybrid_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
             
-            // FIX: Apply TOTG smoothing to OMPL plan
             robot_trajectory::RobotTrajectory rt(iface.getRobotModel(), iface.getName());
             rt.setRobotTrajectoryMsg(*iface.getCurrentState(), hybrid_plan.trajectory_);
             trajectory_processing::TimeOptimalTrajectoryGeneration totg;
@@ -404,9 +398,8 @@ bool smartVerticalLift(
         std::cout << "    [-] Extraction phase blocked. Falling back to global OMPL...\n";
     }
 
-    // =========================================================================
-    // ATTEMPT 3: Pure Global OMPL (Strict)
-    // =========================================================================
+    // 3. OMPL MOTION DIRECTLY TO SAFE_Z WITH STRICT CONSTRAINTS
+
     std::cout << "    [-] Attempting Pure Constrained OMPL from current pose...\n";
     iface.setStartStateToCurrentState();
     
@@ -435,13 +428,11 @@ bool smartVerticalLift(
     }
     iface.clearPathConstraints();
 
-    // =========================================================================
-    // ATTEMPT 4: Relaxed OMPL (Allow slight tilting)
-    // =========================================================================
+    // 3. OMPL MOTION DIRECTLY TO TARGET_Z WITH RELAXED CONSTRAINTS
+
     std::cout << "    [-] Strict OMPL failed. Relaxing constraints (allowing slight tilt)...\n";
     iface.setStartStateToCurrentState();
     
-    // Relax constraints to ~45 degrees to bypass singularities
     base_ocm.absolute_x_axis_tolerance = M_PI; 
     base_ocm.absolute_y_axis_tolerance = 0.8;
     base_ocm.absolute_z_axis_tolerance = 0.8; 
@@ -468,14 +459,14 @@ bool smartVerticalLift(
     }
     iface.clearPathConstraints();
 
-    // =========================================================================
-    // ATTEMPT 5: Abort
-    // =========================================================================
+    // 5. ABORT
+
     std::cout << "    [!] CRITICAL: All lift attempts failed. Tube is trapped.\n";
     return false;
 }
 
-// MAIN
+// MAIN FUNCTION
+
 int main(int argc, char * argv[])
 {
     rclcpp::init(argc, argv);
@@ -545,7 +536,8 @@ int main(int argc, char * argv[])
         }
     );
 
-    // --- MAIN EXECUTION LOOP ---
+    // MAIN EXECUTION LOOP
+    
     while (rclcpp::ok()) {
         std::string line = "";
         
@@ -710,17 +702,17 @@ int main(int argc, char * argv[])
             arm_interface.setPathConstraints(strict_constraints);
 
             moveit::planning_interface::MoveGroupInterface::Plan strict_plan;
+            
             if (arm_interface.plan(strict_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
                 std::cout << "    [+] Valid OMPL detour found. Smoothing velocities...\n";
                 
-                // FIX: Force manual time parameterization on the STOMP path
                 robot_trajectory::RobotTrajectory rt(arm_interface.getRobotModel(), arm_interface.getName());
                 rt.setRobotTrajectoryMsg(*arm_interface.getCurrentState(), strict_plan.trajectory_);
                 
                 trajectory_processing::TimeOptimalTrajectoryGeneration totg;
                 totg.computeTimeStamps(rt, VEL_SCALE_LIQUID, ACC_SCALE_LIQUID);
                 
-                rt.getRobotTrajectoryMsg(strict_plan.trajectory_); // Save the safe velocities back
+                rt.getRobotTrajectoryMsg(strict_plan.trajectory_);
 
                 if (arm_interface.execute(strict_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
                     waitForStateSettle(arm_interface);
