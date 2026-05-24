@@ -1,4 +1,4 @@
-// Liquid Handling Robotic System
+// LIQUID HANDLING ROBOTIC SYSTEM (LAB ASSISTANT)
 
 #include <memory>
 #include <thread>
@@ -190,7 +190,7 @@ bool smartVerticalDrop(
     base_ocm.orientation.w = q_upright.w();
     base_ocm.weight = 1.0;
 
-    // 2. HYBRID MOVEMENT (OMPL to APPROACH_Z AND CARTESIAN TO TARGET_Z)
+    // 2. HYBRID MOVEMENT (OMPL TO APPROACH_Z AND CARTESIAN TO TARGET_Z)
 
     double approach_z = target_z + 0.08; 
     
