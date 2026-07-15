@@ -34,7 +34,7 @@ static constexpr double VEL_SCALE_TRANSIT  = 0.3;
 static constexpr double VEL_SCALE_LIQUID   = 0.3; 
 static constexpr double ACC_SCALE_TRANSIT  = 0.1;
 static constexpr double ACC_SCALE_LIQUID   = 0.1;
-static constexpr double CARTESIAN_EEF_STEP = 0.005; 
+static constexpr double CARTESIAN_EEF_STEP = 0.01; 
 static constexpr double MIN_CARTESIAN_FRACTION = 0.8;
 static constexpr double JUMP_THRESHOLD     = 1.5;
 
@@ -192,7 +192,7 @@ bool smartVerticalDrop(
 
     // 2. HYBRID MOVEMENT (OMPL TO APPROACH_Z AND CARTESIAN TO TARGET_Z)
 
-    double approach_z = target_z + 0.08; 
+    double approach_z = target_z + 0.1; 
     
     // ATTEMPT THE HYBRID MOTION ONLY IF WE ARE ABOVE THE APPROACH HEIGHT
     
@@ -522,8 +522,8 @@ int main(int argc, char * argv[])
         return -1;
     }
 
-    arm_interface.setGoalPositionTolerance(0.001);
-    arm_interface.setGoalOrientationTolerance(0.001);
+    arm_interface.setGoalPositionTolerance(0.01);
+    arm_interface.setGoalOrientationTolerance(0.01);
 
     std::cout << "\n>>> Ready. Waiting for GUI commands on '/gui_commands'...\n";
 
@@ -615,7 +615,7 @@ int main(int argc, char * argv[])
                         geometry_msgs::msg::TransformStamped t = tf_buffer->lookupTransform(
                             "marker_base", target_frame, tf2::TimePointZero);
                         tx = t.transform.translation.x + 0.0;
-                        ty = t.transform.translation.y + 0.11;
+                        ty = t.transform.translation.y + 0.0;
                         tz = 0.15; 
                     } catch (const tf2::TransformException & ex) {
                         std::cout << "    [-] Falling back to hardcoded positions\n";
