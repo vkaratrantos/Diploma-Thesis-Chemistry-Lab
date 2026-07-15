@@ -691,216 +691,64 @@ int main(int argc, char * argv[])
             if (!(ss >> tx >> ty >> tz)) continue;
         }
 
-        // PHASE 1: LIFT
+        // ---------------------------------------------------------
+        // THE NEW, SINGLE-STEP OMPL MOVEMENT 
+        // (Replacing the previous 3-Phase Cartesian Logic)
+        // ---------------------------------------------------------
         
-        std::cout << "\n--- [PHASE 1] LIFT to Standard Z=" << SAFE_Z_TARGET << " ---\n";
+        std::cout << "\n--- MOVING TO TARGET Z=" << tz << " ---\n";
+        
         arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
         arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_LIQUID);
 
-        if (smartVerticalLift(arm_interface, SAFE_Z_TARGET, q_upright)) {
-            waitForStateSettle(arm_interface);
-        } else {
-            std::cout << "[-] [PHASE 1] Cannot reach standard lift height. Skipping.\n";
-            continue;
-        }
-
-        // PHASE 2: HORIZONTAL MOVE
-        
-        std::cout << "\n--- [PHASE 2] HORIZONTAL MOVE to (" << tx << ", " << ty << ") ---\n";
-        arm_interface.setStartStateToCurrentState();
-        geometry_msgs::msg::Pose start_pose = arm_interface.getCurrentPose().pose;
-        geometry_msgs::msg::Pose target_pose = start_pose;
+        geometry_msgs::msg::Pose target_pose;
         target_pose.position.x = tx;
         target_pose.position.y = ty;
-        target_pose.position.z = SAFE_Z_TARGET; 
+        target_pose.position.z = tz;
+        target_pose.orientation.x = q_upright.x();
+        target_pose.orientation.y = q_upright.y();
+        target_pose.orientation.z = q_upright.z();
+        target_pose.orientation.w = q_upright.w();
 
-        bool moved = false;
+        arm_interface.setPoseTarget(target_pose);
 
-        // HORIZONTAL ATTEMPTS
-        // 1. CARTESIAN PATHS
+        // Keep the orientation constraint so we don't spill liquid during transit
+        moveit_msgs::msg::OrientationConstraint ocm;
+        ocm.link_name = arm_interface.getEndEffectorLink();
+        ocm.header.frame_id = arm_interface.getPlanningFrame();
+        ocm.orientation = target_pose.orientation;
+        ocm.absolute_x_axis_tolerance = 0.3; // Allow slight wiggle to help planner find a path
+        ocm.absolute_y_axis_tolerance = 0.3;
+        ocm.absolute_z_axis_tolerance = M_PI; // Z-axis (yaw) can rotate freely
+        ocm.weight = 1.0;
+
+        moveit_msgs::msg::Constraints constraints;
+        constraints.orientation_constraints.push_back(ocm);
+        arm_interface.setPathConstraints(constraints);
+
+        moveit::planning_interface::MoveGroupInterface::Plan unified_plan;
         
-        std::cout << "    [!] Attempting Cartesian interpolation...\n";
-        
-        if (computeCartesianMove(arm_interface, target_pose, "HORIZ_DIRECT")) {
-            waitForStateSettle(arm_interface);
-            moved = true;
-        } 
-
-        // 2. STRICT OMPL
-        
-        if (!moved) {
-            std::cout << "    [-] Cartesian path blocked. Falling back to Strict OMPL...\n";
+        if (arm_interface.plan(unified_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+            std::cout << "    [+] Plan found! Smoothing trajectory...\n";
             
-            arm_interface.setStartStateToCurrentState();
-            arm_interface.setPlanningPipelineId("ompl"); 
-            arm_interface.setPlannerId("RRTConnectkConfigDefault"); 
-            arm_interface.setPlanningTime(10.0); 
-            arm_interface.setPoseTarget(target_pose);
+            // Retiming the trajectory for smooth liquid handling speeds
+            robot_trajectory::RobotTrajectory rt(arm_interface.getRobotModel(), arm_interface.getName());
+            rt.setRobotTrajectoryMsg(*arm_interface.getCurrentState(), unified_plan.trajectory_);
+            trajectory_processing::TimeOptimalTrajectoryGeneration totg;
+            totg.computeTimeStamps(rt, VEL_SCALE_LIQUID, ACC_SCALE_LIQUID);
+            rt.getRobotTrajectoryMsg(unified_plan.trajectory_);
 
-            moveit_msgs::msg::OrientationConstraint strict_ocm;
-            strict_ocm.link_name = arm_interface.getEndEffectorLink();
-            strict_ocm.header.frame_id = arm_interface.getPlanningFrame();
-            strict_ocm.orientation.x = q_upright.x();
-            strict_ocm.orientation.y = q_upright.y();
-            strict_ocm.orientation.z = q_upright.z();
-            strict_ocm.orientation.w = q_upright.w();
-            
-            strict_ocm.absolute_x_axis_tolerance = M_PI; 
-            strict_ocm.absolute_y_axis_tolerance = 0.4; 
-            strict_ocm.absolute_z_axis_tolerance = 0.4; 
-            strict_ocm.weight = 1.0;
-
-            moveit_msgs::msg::Constraints strict_constraints;
-            strict_constraints.orientation_constraints.push_back(strict_ocm);
-            arm_interface.setPathConstraints(strict_constraints);
-
-            moveit::planning_interface::MoveGroupInterface::Plan strict_plan;
-            
-            if (arm_interface.plan(strict_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-                std::cout << "    [+] Valid OMPL detour found. Smoothing velocities...\n";
-                
-                robot_trajectory::RobotTrajectory rt(arm_interface.getRobotModel(), arm_interface.getName());
-                rt.setRobotTrajectoryMsg(*arm_interface.getCurrentState(), strict_plan.trajectory_);
-                
-                trajectory_processing::TimeOptimalTrajectoryGeneration totg;
-                totg.computeTimeStamps(rt, VEL_SCALE_LIQUID, ACC_SCALE_LIQUID);
-                
-                rt.getRobotTrajectoryMsg(strict_plan.trajectory_);
-
-                if (arm_interface.execute(strict_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-                    waitForStateSettle(arm_interface);
-                    moved = true;
-                }
-            }
-            arm_interface.clearPathConstraints();
-        }
-        
-        // 3. Z-EXPLORATION
-
-        if (!moved) {
-            std::cout << "[-] Strict OMPL blocked. Exploring alternative Z-heights... \n";
-            
-            std::vector<double> z_offsets = {-0.01, 0.01, -0.02, 0.02, -0.03, 0.03, -0.04, 0.04};
-            
-            for (double offset : z_offsets) {
-                std::cout <<"     [*] Trying Z-offset: " << (offset * 100.0) << " cm...\n";
-            
-                geometry_msgs::msg::Pose explore_target = target_pose;
-                explore_target.position.z += offset;
-            
-                arm_interface.setStartStateToCurrentState();
-                arm_interface.setPoseTarget(explore_target);
-            
-                moveit_msgs::msg::OrientationConstraint strict_ocm;
-                strict_ocm.link_name = arm_interface.getEndEffectorLink();
-                strict_ocm.header.frame_id = arm_interface.getPlanningFrame();
-                strict_ocm.orientation.x = q_upright.x();
-                strict_ocm.orientation.y = q_upright.y();
-                strict_ocm.orientation.z = q_upright.z();
-                strict_ocm.orientation.w = q_upright.w();
-                strict_ocm.absolute_x_axis_tolerance = M_PI; 
-                strict_ocm.absolute_y_axis_tolerance = 0.4; 
-                strict_ocm.absolute_z_axis_tolerance = 0.4; 
-                strict_ocm.weight = 1.0;
-            
-                moveit_msgs::msg::Constraints explore_constraints;
-                explore_constraints.orientation_constraints.push_back(strict_ocm);
-                arm_interface.setPathConstraints(explore_constraints);
-            
-                moveit::planning_interface::MoveGroupInterface::Plan explore_plan;
-                if (arm_interface.plan(explore_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-                
-                    robot_trajectory::RobotTrajectory rt(arm_interface.getRobotModel(), arm_interface.getName());
-                    rt.setRobotTrajectoryMsg(*arm_interface.getCurrentState(), explore_plan.trajectory_);
-                    trajectory_processing::TimeOptimalTrajectoryGeneration totg;
-                    totg.computeTimeStamps(rt, VEL_SCALE_LIQUID, ACC_SCALE_LIQUID);
-                    rt.getRobotTrajectoryMsg(explore_plan.trajectory_);
-                
-                    if (arm_interface.execute(explore_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-                        waitForStateSettle(arm_interface);
-                    
-                        std::cout << "    [+] Offset. Realigning to 0.28 m...\n";
-                        arm_interface.setStartStateToCurrentState();
-                    
-                        if (computeCartesianMove(arm_interface, target_pose, "HORIZ_DROP")) {
-                            waitForStateSettle(arm_interface);
-                        } else {
-                            std::cout << "    [-] Failed to recover to standard Z! Continuing from current height.\n";
-                        }
-                        
-                        moved = true;
-                        arm_interface.clearPathConstraints();
-                        break;
-                    }
-                }
-                arm_interface.clearPathConstraints();
-            }
-        }
-        
-        // 4. RELAXED OMPL
-
-        if (!moved) {
-            std::cout << "    [-] Elevated Hop blocked. Relaxing orientation constraints...\n";
-            
-            arm_interface.setStartStateToCurrentState();
-            arm_interface.setPoseTarget(target_pose);
-
-            moveit_msgs::msg::OrientationConstraint relaxed_ocm;
-            relaxed_ocm.link_name = arm_interface.getEndEffectorLink();
-            relaxed_ocm.header.frame_id = arm_interface.getPlanningFrame();
-            relaxed_ocm.orientation.x = q_upright.x();
-            relaxed_ocm.orientation.y = q_upright.y();
-            relaxed_ocm.orientation.z = q_upright.z();
-            relaxed_ocm.orientation.w = q_upright.w();
-            relaxed_ocm.absolute_x_axis_tolerance = M_PI;
-            relaxed_ocm.absolute_y_axis_tolerance = 0.8;
-            relaxed_ocm.absolute_z_axis_tolerance = 0.8; 
-            relaxed_ocm.weight = 1.0;
-
-            moveit_msgs::msg::Constraints relaxed_constraints;
-            relaxed_constraints.orientation_constraints.push_back(relaxed_ocm);
-            arm_interface.setPathConstraints(relaxed_constraints);
-
-            moveit::planning_interface::MoveGroupInterface::Plan relaxed_plan;
-            if (arm_interface.plan(relaxed_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-                
-                robot_trajectory::RobotTrajectory rt(arm_interface.getRobotModel(), arm_interface.getName());
-                rt.setRobotTrajectoryMsg(*arm_interface.getCurrentState(), relaxed_plan.trajectory_);
-                trajectory_processing::TimeOptimalTrajectoryGeneration totg;
-                totg.computeTimeStamps(rt, VEL_SCALE_LIQUID, ACC_SCALE_LIQUID);
-                rt.getRobotTrajectoryMsg(relaxed_plan.trajectory_); 
-
-                if (arm_interface.execute(relaxed_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-                    waitForStateSettle(arm_interface);
-                    moved = true;
-                }
-            }
-            arm_interface.clearPathConstraints();
-        }
-
-        // 5. ABORT
-
-        if (!moved) {
-            std::cout << "[-] [PHASE 2] Target unreachable. All horizontal planning failed.\n";
-            continue; 
-        }
-        
-        // PHASE 3: DROP
-        
-        std::cout << "\n--- [PHASE 3] DROP to Z=" << tz << " ---\n";
-        arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
-        arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_LIQUID);
-
-        bool dropped = false;
-        
-        for (double z_try = tz; z_try <= tz + DROP_Z_MAX_RETRY && !dropped; z_try += DROP_Z_RETRY_STEP) {
-        
-            if (smartVerticalDrop(arm_interface, z_try, q_upright)) {
-                dropped = true;
+            if (arm_interface.execute(unified_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
                 waitForStateSettle(arm_interface);
-                std::cout << "\n>>> Sequence complete! Target reached safely.\n";
+                std::cout << "\n>>> Target reached safely.\n";
+            } else {
+                std::cout << "    [-] Execution failed.\n";
             }
+        } else {
+            std::cout << "    [!] CRITICAL: Planning failed. Target unreachable or in collision.\n";
         }
+        
+        arm_interface.clearPathConstraints();
     }
 
     std::cout << "\n>>> Shutting down.\n";
