@@ -108,7 +108,7 @@ void setupCollisionObjects(const std::string& frame_id) {
     mixer.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
     mixer.primitives[0].dimensions = {0.17, 0.06}; // {HEIGHT, RADIUS}
     mixer.primitive_poses.resize(1);
-    mixer.primitive_poses[0].position.x = -0.29;
+    mixer.primitive_poses[0].position.x = -0.32;
     mixer.primitive_poses[0].position.y = -0.15;
     mixer.primitive_poses[0].position.z = 0.06; 
     mixer.primitive_poses[0].orientation.w = 1.0;
@@ -185,6 +185,9 @@ int main(int argc, char * argv[])
     arm_interface.setPlanningPipelineId("ompl");
     arm_interface.setPlannerId("RRTConnectkConfigDefault");
     arm_interface.setPlanningTime(10.0);
+    
+    arm_interface.setNumPlanningAttempts(5);
+    arm_interface.setWorkspace(-0.5, -0.5, -0.05, 0.5, 0.5, 0.6);
     arm_interface.setGoalPositionTolerance(0.01);
     arm_interface.setGoalOrientationTolerance(0.1);
 
@@ -349,12 +352,12 @@ int main(int argc, char * argv[])
                         tz = 0.15; 
                     } catch (const tf2::TransformException & ex) {
                         std::cout << "    [-] Falling back to hardcoded positions\n";
-                        if (marker_id == 1) { tx = -0.19; ty = -0.16; tz = 0.1; } 
-                        else if (marker_id == 2) { tx = -0.1; ty = -0.19; tz = 0.1; } 
-                        else if (marker_id == 3) { tx = 0.0; ty = -0.22; tz = 0.1; } 
-                        else if (marker_id == 4) { tx = 0.1; ty = -0.19; tz = 0.1; } 
-                        else if (marker_id == 5) { tx = 0.19; ty = -0.16; tz = 0.1; } 
-                        else if (marker_id == 6) { tx = -0.17; ty = -0.07; tz = 0.2; } 
+                        if (marker_id == 1) { tx = -0.19; ty = -0.15; tz = 0.1; } 
+                        else if (marker_id == 2) { tx = -0.1; ty = -0.17; tz = 0.1; } 
+                        else if (marker_id == 3) { tx = 0.0; ty = -0.21; tz = 0.1; } 
+                        else if (marker_id == 4) { tx = 0.1; ty = -0.17; tz = 0.1; } 
+                        else if (marker_id == 5) { tx = 0.19; ty = -0.15; tz = 0.1; } 
+                        else if (marker_id == 6) { tx = -0.19; ty = -0.06; tz = 0.2; } 
                         else {
                             continue; 
                         }
@@ -368,9 +371,7 @@ int main(int argc, char * argv[])
             if (!(ss >> tx >> ty >> tz)) continue;
         }
 
-        // ---------------------------------------------------------
-        // THE NEW, SINGLE-STEP OMPL MOVEMENT WITH RECOVERY LOGIC
-        // ---------------------------------------------------------
+        // SIMPLE OMPL MOVEMENT
         
         std::cout << "\n--- MOVING TO TARGET Z=" << tz << " ---\n";
         
@@ -389,8 +390,8 @@ int main(int argc, char * argv[])
         ocm.header.frame_id = arm_interface.getPlanningFrame();
         ocm.orientation = target_pose.orientation;
         ocm.absolute_x_axis_tolerance = M_PI; 
-        ocm.absolute_y_axis_tolerance = 0.3;
-        ocm.absolute_z_axis_tolerance = 0.3; 
+        ocm.absolute_y_axis_tolerance = 0.4;
+        ocm.absolute_z_axis_tolerance = 0.4; 
         ocm.weight = 1.0;
 
         moveit_msgs::msg::Constraints constraints;
