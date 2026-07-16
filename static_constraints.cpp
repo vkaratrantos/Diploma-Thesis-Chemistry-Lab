@@ -58,11 +58,11 @@ void setupCollisionObjects(const std::string& frame_id) {
     table.header.frame_id = frame_id;
     table.primitives.resize(1);
     table.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
-    table.primitives[0].dimensions = {1.0, 1.0, 0.02}; 
+    table.primitives[0].dimensions = {1.0, 1.0, 0.04}; 
     table.primitive_poses.resize(1);
     table.primitive_poses[0].position.x = 0.0;
     table.primitive_poses[0].position.y = 0.0;
-    table.primitive_poses[0].position.z = -0.02; 
+    table.primitive_poses[0].position.z = -0.03; 
     table.primitive_poses[0].orientation.w = 1.0;
     table.operation = table.ADD;
     collision_objects.push_back(table);
@@ -74,11 +74,11 @@ void setupCollisionObjects(const std::string& frame_id) {
     wall.header.frame_id = frame_id;
     wall.primitives.resize(1);
     wall.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
-    wall.primitives[0].dimensions = { 0.5, 0.2, 0.05 };
+    wall.primitives[0].dimensions = { 0.7, 0.2, 0.05 };
     wall.primitive_poses.resize(1);
     wall.primitive_poses[0].position.x = 0.0;
     wall.primitive_poses[0].position.y = 0.18;
-    wall.primitive_poses[0].position.z = 0.00;   
+    wall.primitive_poses[0].position.z = 0.02;   
     wall.primitive_poses[0].orientation.w = 1.0;
     wall.operation = wall.ADD;
     collision_objects.push_back(wall);
@@ -90,11 +90,11 @@ void setupCollisionObjects(const std::string& frame_id) {
     wall2.header.frame_id = frame_id;
     wall2.primitives.resize(1);
     wall2.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
-    wall2.primitives[0].dimensions = { 0.2, 0.4, 0.15 };
+    wall2.primitives[0].dimensions = { 0.2, 0.4, 0.2 };
     wall2.primitive_poses.resize(1);
     wall2.primitive_poses[0].position.x = -0.4;
     wall2.primitive_poses[0].position.y = 0.1;
-    wall2.primitive_poses[0].position.z = 0.00;   
+    wall2.primitive_poses[0].position.z = 0.03;   
     wall2.primitive_poses[0].orientation.w = 1.0;
     wall2.operation = wall2.ADD;
     collision_objects.push_back(wall2);
@@ -106,11 +106,11 @@ void setupCollisionObjects(const std::string& frame_id) {
     mixer.header.frame_id = frame_id;
     mixer.primitives.resize(1);
     mixer.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
-    mixer.primitives[0].dimensions = {0.2, 0.07}; // {HEIGHT, RADIUS}
+    mixer.primitives[0].dimensions = {0.17, 0.06}; // {HEIGHT, RADIUS}
     mixer.primitive_poses.resize(1);
     mixer.primitive_poses[0].position.x = -0.29;
     mixer.primitive_poses[0].position.y = -0.15;
-    mixer.primitive_poses[0].position.z = 0.04; 
+    mixer.primitive_poses[0].position.z = 0.06; 
     mixer.primitive_poses[0].orientation.w = 1.0;
     mixer.operation = mixer.ADD;
     collision_objects.push_back(mixer);
@@ -119,11 +119,11 @@ void setupCollisionObjects(const std::string& frame_id) {
     
     struct TubePose { std::string id; double x; double y; double z; };
     std::vector<TubePose> tubes = {
-        {"tube_1", -0.155, -0.28, 0.07},
-        {"tube_2", -0.071, -0.281, 0.07},
-        {"tube_3",  0.022, -0.28, 0.07},
-        {"tube_4",  0.11, -0.28, 0.07},
-        {"tube_5",  0.186, -0.28, 0.07}
+        {"tube_1", -0.19, -0.24, 0.07},
+        {"tube_2", -0.1, -0.28, 0.07},
+        {"tube_3",  0.0, -0.32, 0.07},
+        {"tube_4",  0.1, -0.28, 0.07},
+        {"tube_5",  0.19, -0.24, 0.07}
     };
 
     for (const auto& t : tubes) {
@@ -132,7 +132,7 @@ void setupCollisionObjects(const std::string& frame_id) {
         tube.header.frame_id = frame_id;
         tube.primitives.resize(1);
         tube.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
-        tube.primitives[0].dimensions = {0.10, 0.01};
+        tube.primitives[0].dimensions = {0.13, 0.012};
         tube.primitive_poses.resize(1);
         tube.primitive_poses[0].position.x = t.x;
         tube.primitive_poses[0].position.y = t.y;
@@ -349,11 +349,11 @@ int main(int argc, char * argv[])
                         tz = 0.15; 
                     } catch (const tf2::TransformException & ex) {
                         std::cout << "    [-] Falling back to hardcoded positions\n";
-                        if (marker_id == 1) { tx = -0.155; ty = -0.16; tz = 0.1; } 
-                        else if (marker_id == 2) { tx = -0.071; ty = -0.16; tz = 0.1; } 
-                        else if (marker_id == 3) { tx = 0.022; ty = -0.16; tz = 0.1; } 
-                        else if (marker_id == 4) { tx = 0.117; ty = -0.16; tz = 0.1; } 
-                        else if (marker_id == 5) { tx = 0.186; ty = -0.16; tz = 0.1; } 
+                        if (marker_id == 1) { tx = -0.19; ty = -0.16; tz = 0.1; } 
+                        else if (marker_id == 2) { tx = -0.1; ty = -0.19; tz = 0.1; } 
+                        else if (marker_id == 3) { tx = 0.0; ty = -0.22; tz = 0.1; } 
+                        else if (marker_id == 4) { tx = 0.1; ty = -0.19; tz = 0.1; } 
+                        else if (marker_id == 5) { tx = 0.19; ty = -0.16; tz = 0.1; } 
                         else if (marker_id == 6) { tx = -0.17; ty = -0.07; tz = 0.2; } 
                         else {
                             continue; 
@@ -369,7 +369,7 @@ int main(int argc, char * argv[])
         }
 
         // ---------------------------------------------------------
-        // THE NEW, SINGLE-STEP OMPL MOVEMENT 
+        // THE NEW, SINGLE-STEP OMPL MOVEMENT WITH RECOVERY LOGIC
         // ---------------------------------------------------------
         
         std::cout << "\n--- MOVING TO TARGET Z=" << tz << " ---\n";
@@ -383,63 +383,98 @@ int main(int argc, char * argv[])
         target_pose.orientation.z = q_upright.z();
         target_pose.orientation.w = q_upright.w();
 
-        arm_interface.setPoseTarget(target_pose);
+        // Prepare the orientation constraint object for the mixer
+        moveit_msgs::msg::OrientationConstraint ocm;
+        ocm.link_name = arm_interface.getEndEffectorLink();
+        ocm.header.frame_id = arm_interface.getPlanningFrame();
+        ocm.orientation = target_pose.orientation;
+        ocm.absolute_x_axis_tolerance = M_PI; 
+        ocm.absolute_y_axis_tolerance = 0.3;
+        ocm.absolute_z_axis_tolerance = 0.3; 
+        ocm.weight = 1.0;
 
-        // 1. SET SPEEDS BASED ON PAYLOAD
-        if (!attached_tube.empty()) {
-            arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
-            arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_LIQUID);
-        } else {
-            arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_TRANSIT);
-            arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_TRANSIT);
-        }
+        moveit_msgs::msg::Constraints constraints;
+        constraints.orientation_constraints.push_back(ocm);
 
-        // 2. APPLY ORIENTATION CONSTRAINTS ONLY FOR THE MIXER (MARKER 6)
-        if (!attached_tube.empty() && current_marker_id == 6) {
-            std::cout << "    [*] Holding tube & moving to mixer: Applying upright orientation constraints.\n";
-            
-            moveit_msgs::msg::OrientationConstraint ocm;
-            ocm.link_name = arm_interface.getEndEffectorLink();
-            ocm.header.frame_id = arm_interface.getPlanningFrame();
-            ocm.orientation = target_pose.orientation;
-            ocm.absolute_x_axis_tolerance = M_PI; 
-            ocm.absolute_y_axis_tolerance = 0.3;
-            ocm.absolute_z_axis_tolerance = 0.3; 
-            ocm.weight = 1.0;
-
-            moveit_msgs::msg::Constraints constraints;
-            constraints.orientation_constraints.push_back(ocm);
-            arm_interface.setPathConstraints(constraints);
-        } else {
-            std::cout << "    [*] Moving freely without orientation constraints.\n";
-            
-            // Ensure no lingering constraints are applied
-            arm_interface.clearPathConstraints();
-        }
-
-        moveit::planning_interface::MoveGroupInterface::Plan unified_plan;
+        // Calculate appropriate speeds
+        double current_vel_scale = attached_tube.empty() ? VEL_SCALE_TRANSIT : VEL_SCALE_LIQUID;
+        double current_acc_scale = attached_tube.empty() ? ACC_SCALE_TRANSIT : ACC_SCALE_LIQUID;
         
-        if (arm_interface.plan(unified_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-            std::cout << "    [+] Plan found! Smoothing trajectory...\n";
-            
-            // Retiming the trajectory to match the selected scale factors
-            double current_vel_scale = attached_tube.empty() ? VEL_SCALE_TRANSIT : VEL_SCALE_LIQUID;
-            double current_acc_scale = attached_tube.empty() ? ACC_SCALE_TRANSIT : ACC_SCALE_LIQUID;
-            
-            robot_trajectory::RobotTrajectory rt(arm_interface.getRobotModel(), arm_interface.getName());
-            rt.setRobotTrajectoryMsg(*arm_interface.getCurrentState(), unified_plan.trajectory_);
-            trajectory_processing::TimeOptimalTrajectoryGeneration totg;
-            totg.computeTimeStamps(rt, current_vel_scale, current_acc_scale);
-            rt.getRobotTrajectoryMsg(unified_plan.trajectory_);
+        arm_interface.setMaxVelocityScalingFactor(current_vel_scale);
+        arm_interface.setMaxAccelerationScalingFactor(current_acc_scale);
 
-            if (arm_interface.execute(unified_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
-                waitForStateSettle(arm_interface);
-                std::cout << "\n>>> Target reached safely.\n";
+        bool target_reached = false;
+
+        // RETRY LOOP: 2 Attempts maximum
+        for (int attempt = 1; attempt <= 2; ++attempt) {
+            
+            arm_interface.setPoseTarget(target_pose);
+
+            // 1. APPLY ORIENTATION CONSTRAINTS ONLY FOR THE MIXER (MARKER 6)
+            if (!attached_tube.empty() && current_marker_id == 6) {
+                if (attempt == 1) std::cout << "    [*] Holding tube & moving to mixer: Applying upright constraints.\n";
+                arm_interface.setPathConstraints(constraints);
             } else {
-                std::cout << "    [-] Execution failed.\n";
+                if (attempt == 1) std::cout << "    [*] Moving freely without orientation constraints.\n";
+                arm_interface.clearPathConstraints();
             }
-        } else {
-            std::cout << "    [!] CRITICAL: Planning failed. Target unreachable or in collision.\n";
+
+            moveit::planning_interface::MoveGroupInterface::Plan unified_plan;
+            
+            if (arm_interface.plan(unified_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                std::cout << "    [+] Plan found (Attempt " << attempt << ")! Smoothing trajectory...\n";
+                
+                robot_trajectory::RobotTrajectory rt(arm_interface.getRobotModel(), arm_interface.getName());
+                rt.setRobotTrajectoryMsg(*arm_interface.getCurrentState(), unified_plan.trajectory_);
+                trajectory_processing::TimeOptimalTrajectoryGeneration totg;
+                totg.computeTimeStamps(rt, current_vel_scale, current_acc_scale);
+                rt.getRobotTrajectoryMsg(unified_plan.trajectory_);
+
+                if (arm_interface.execute(unified_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                    waitForStateSettle(arm_interface);
+                    std::cout << "\n>>> Target reached safely.\n";
+                    target_reached = true;
+                    break; // Success! Exit the retry loop.
+                } else {
+                    std::cout << "    [-] Execution failed on Attempt " << attempt << ".\n";
+                }
+            } else {
+                std::cout << "    [-] Planning failed on Attempt " << attempt << ".\n";
+            }
+
+            // 2. RECOVERY MECHANISM (Only triggers if Attempt 1 fails)
+            if (attempt == 1) {
+                std::cout << "\n    [!] RECOVERY: Moving to Safe Position (-0.15, -0.15, 0.20) to reset arm posture...\n";
+                
+                // Temporarily clear constraints to guarantee we can untwist and reach the safe spot
+                arm_interface.clearPathConstraints(); 
+                arm_interface.setPoseTarget(start_pose);
+                
+                moveit::planning_interface::MoveGroupInterface::Plan recovery_plan;
+                if (arm_interface.plan(recovery_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                    
+                    robot_trajectory::RobotTrajectory rt(arm_interface.getRobotModel(), arm_interface.getName());
+                    rt.setRobotTrajectoryMsg(*arm_interface.getCurrentState(), recovery_plan.trajectory_);
+                    trajectory_processing::TimeOptimalTrajectoryGeneration totg;
+                    totg.computeTimeStamps(rt, current_vel_scale, current_acc_scale);
+                    rt.getRobotTrajectoryMsg(recovery_plan.trajectory_);
+
+                    if (arm_interface.execute(recovery_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
+                        waitForStateSettle(arm_interface);
+                        std::cout << "    [*] Safe position reached. Retrying target destination...\n\n";
+                    } else {
+                        std::cout << "    [-] Recovery execution failed! Arm might be physically stuck.\n";
+                        break; // If recovery fails, abort entirely
+                    }
+                } else {
+                    std::cout << "    [-] Could not plan path to safe position! Arm is trapped.\n";
+                    break; // If recovery fails, abort entirely
+                }
+            }
+        }
+
+        if (!target_reached) {
+            std::cout << "    [!] CRITICAL: Target unreachable or in collision even after recovery attempt.\n";
         }
         
         // Clean up constraints after every move just to be safe
