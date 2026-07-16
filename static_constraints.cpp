@@ -370,7 +370,6 @@ int main(int argc, char * argv[])
 
         // ---------------------------------------------------------
         // THE NEW, SINGLE-STEP OMPL MOVEMENT 
-        // (Replacing the previous 3-Phase Cartesian Logic)
         // ---------------------------------------------------------
         
         std::cout << "\n--- MOVING TO TARGET Z=" << tz << " ---\n";
@@ -386,13 +385,19 @@ int main(int argc, char * argv[])
 
         arm_interface.setPoseTarget(target_pose);
 
-        // CHECK IF WE ARE HOLDING A TUBE TO DETERMINE CONSTRAINTS AND SPEED
+        // 1. SET SPEEDS BASED ON PAYLOAD
         if (!attached_tube.empty()) {
-            std::cout << "    [*] Holding tube: Applying upright orientation constraints & liquid speeds.\n";
-            
             arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_LIQUID);
             arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_LIQUID);
+        } else {
+            arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_TRANSIT);
+            arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_TRANSIT);
+        }
 
+        // 2. APPLY ORIENTATION CONSTRAINTS ONLY FOR THE MIXER (MARKER 6)
+        if (!attached_tube.empty() && current_marker_id == 6) {
+            std::cout << "    [*] Holding tube & moving to mixer: Applying upright orientation constraints.\n";
+            
             moveit_msgs::msg::OrientationConstraint ocm;
             ocm.link_name = arm_interface.getEndEffectorLink();
             ocm.header.frame_id = arm_interface.getPlanningFrame();
@@ -406,10 +411,7 @@ int main(int argc, char * argv[])
             constraints.orientation_constraints.push_back(ocm);
             arm_interface.setPathConstraints(constraints);
         } else {
-            std::cout << "    [*] Empty gripper: Moving freely without constraints at transit speeds.\n";
-            
-            arm_interface.setMaxVelocityScalingFactor(VEL_SCALE_TRANSIT);
-            arm_interface.setMaxAccelerationScalingFactor(ACC_SCALE_TRANSIT);
+            std::cout << "    [*] Moving freely without orientation constraints.\n";
             
             // Ensure no lingering constraints are applied
             arm_interface.clearPathConstraints();
