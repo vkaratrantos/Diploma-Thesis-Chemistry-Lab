@@ -10,6 +10,7 @@
 #include <chrono>
 #include <queue> 
 #include <mutex>
+#include <atomic>
 #include <moveit/trajectory_processing/trajectory_tools.h>
 #include <moveit/robot_trajectory/robot_trajectory.h>
 #include <moveit/trajectory_processing/time_optimal_trajectory_generation.h>
@@ -46,7 +47,8 @@ std::mutex queue_mutex;
 
 // COLLISION OBJECTS
 
-void setupCollisionObjects(const std::string& frame_id) {
+// Modified to accept tf_buffer so it can spawn tubes relative to live markers
+void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buffer) {
 
     moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
     std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
@@ -115,35 +117,52 @@ void setupCollisionObjects(const std::string& frame_id) {
     mixer.operation = mixer.ADD;
     collision_objects.push_back(mixer);
     
-    // 5 TEST TUBES (10cm height, 1cm diameter -> 0.005m radius)
-    
-    struct TubePose { std::string id; double x; double y; double z; };
-    std::vector<TubePose> tubes = {
-        {"tube_1", -0.19, -0.24, 0.07},
-        {"tube_2", -0.1, -0.28, 0.07},
-        {"tube_3",  0.0, -0.32, 0.07},
-        {"tube_4",  0.1, -0.28, 0.07},
-        {"tube_5",  0.19, -0.24, 0.07}
-    };
+    // 6 DYNAMIC TEST TUBES (13cm height, 1.2cm diameter)
+    // We dynamically generate them 4cm behind markers 1-6
+    for (int i = 1; i <= 6; ++i) {
+        double tube_x = 0.0, tube_y = 0.0, tube_z = 0.07;
+        bool tf_found = false;
+        
+        try {
+            std::string target_frame = "marker_" + std::to_string(i);
+            geometry_msgs::msg::TransformStamped t = tf_buffer.lookupTransform(
+                "marker_base", target_frame, tf2::TimePointZero);
+                
+            tube_x = t.transform.translation.x;
+            tube_y = t.transform.translation.y + 0.02; // Exactly 4cm behind the marker on the Y axis
+            tube_z = t.transform.translation.z + 0.065; // Adjust Z center since the tube is 13cm tall (0.13 / 2)
+            tf_found = true;
+        } catch (const tf2::TransformException & ex) {
+            std::cout << "    [-] TF for marker_" << i << " not ready yet. Using hardcoded fallback.\n";
+        }
 
-    for (const auto& t : tubes) {
+        // Hardcoded fallbacks just in case the camera is blocked during startup
+        if (!tf_found) {
+            if (i == 1) { tube_x = -0.19; tube_y = -0.24; }
+            else if (i == 2) { tube_x = -0.10; tube_y = -0.28; }
+            else if (i == 3) { tube_x =  0.00; tube_y = -0.32; }
+            else if (i == 4) { tube_x =  0.10; tube_y = -0.28; }
+            else if (i == 5) { tube_x =  0.19; tube_y = -0.24; }
+            else if (i == 6) { tube_x = -0.19; tube_y = -0.06; } // Fallback for 6
+        }
+
         moveit_msgs::msg::CollisionObject tube;
-        tube.id = t.id;
+        tube.id = "tube_" + std::to_string(i);
         tube.header.frame_id = frame_id;
         tube.primitives.resize(1);
         tube.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
-        tube.primitives[0].dimensions = {0.13, 0.012};
+        tube.primitives[0].dimensions = {0.13, 0.012}; // {HEIGHT, RADIUS}
         tube.primitive_poses.resize(1);
-        tube.primitive_poses[0].position.x = t.x;
-        tube.primitive_poses[0].position.y = t.y;
-        tube.primitive_poses[0].position.z = t.z; 
+        tube.primitive_poses[0].position.x = tube_x;
+        tube.primitive_poses[0].position.y = tube_y;
+        tube.primitive_poses[0].position.z = tube_z; 
         tube.primitive_poses[0].orientation.w = 1.0;
         tube.operation = tube.ADD;
         collision_objects.push_back(tube);
     }
     
     planning_scene_interface.applyCollisionObjects(collision_objects);
-    std::cout << ">>> [INIT] Collision objects loaded into scene.\n";
+    std::cout << ">>> [INIT] Collision objects loaded into scene based on Aruco markers.\n";
 }
 
 void waitForStateSettle(
@@ -172,8 +191,11 @@ int main(int argc, char * argv[])
     std::unique_ptr<tf2_ros::Buffer> tf_buffer = std::make_unique<tf2_ros::Buffer>(node->get_clock());
     std::shared_ptr<tf2_ros::TransformListener> tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
     
-    rclcpp::sleep_for(std::chrono::seconds(1));
-    setupCollisionObjects(arm_interface.getPlanningFrame());
+    std::cout << "\n>>> [INIT] Waiting 2 seconds for TF tree to populate from camera...\n";
+    rclcpp::sleep_for(std::chrono::seconds(2));
+    
+    // Pass the populated TF buffer into the setup function
+    setupCollisionObjects(arm_interface.getPlanningFrame(), *tf_buffer);
 
     tf2::Quaternion q_upright;
     q_upright.setRPY(0.0, -M_PI / 2.0, M_PI / 2.0);
@@ -230,6 +252,55 @@ int main(int argc, char * argv[])
 
     std::string attached_tube = "";
     int current_marker_id = -1;
+    
+    // Atomic variable for thread-safe access inside the background timer
+    std::atomic<int> attached_marker_id{-1};
+
+    // ---------------------------------------------------------
+    // DYNAMIC COLLISION UPDATER
+    // Runs automatically in the background executor thread
+    // ---------------------------------------------------------
+    moveit::planning_interface::PlanningSceneInterface dynamic_scene_interface;
+    auto dynamic_updater = node->create_wall_timer(
+        std::chrono::milliseconds(500), 
+        [&]() {
+            std::vector<moveit_msgs::msg::CollisionObject> update_objects;
+            int currently_held_id = attached_marker_id.load();
+
+            for (int i = 1; i <= 6; ++i) {
+                // If we are currently holding this tube, DO NOT update its static position!
+                if (i == currently_held_id) continue;
+
+                try {
+                    std::string target_frame = "marker_" + std::to_string(i);
+                    geometry_msgs::msg::TransformStamped t = tf_buffer->lookupTransform(
+                        "marker_base", target_frame, tf2::TimePointZero);
+
+                    moveit_msgs::msg::CollisionObject tube;
+                    tube.id = "tube_" + std::to_string(i);
+                    tube.header.frame_id = arm_interface.getPlanningFrame();
+                    tube.primitives.resize(1);
+                    tube.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
+                    tube.primitives[0].dimensions = {0.13, 0.012}; 
+                    tube.primitive_poses.resize(1);
+                    tube.primitive_poses[0].position.x = t.transform.translation.x;
+                    tube.primitive_poses[0].position.y = t.transform.translation.y + 0.04;
+                    tube.primitive_poses[0].position.z = t.transform.translation.z + 0.065;
+                    tube.primitive_poses[0].orientation.w = 1.0;
+                    
+                    // ADD operation effectively functions as a MOVE operation if the ID already exists
+                    tube.operation = tube.ADD; 
+                    update_objects.push_back(tube);
+                } catch (...) {
+                    // Marker currently occluded or TF missing, ignore for this tick
+                }
+            }
+
+            if (!update_objects.empty()) {
+                dynamic_scene_interface.applyCollisionObjects(update_objects);
+            }
+        }
+    );
 
     // MAIN EXECUTION LOOP
     
@@ -262,6 +333,7 @@ int main(int argc, char * argv[])
                     arm_interface.detachObject(attached_tube);
                     std::cout << ">>> Detached " << attached_tube << " from the arm. It is now a static obstacle.\n";
                     attached_tube = "";
+                    attached_marker_id.store(-1); // Allow the dynamic updater to start tracking it again
                 }
             }
             continue; 
@@ -271,7 +343,7 @@ int main(int argc, char * argv[])
             std::cout << ">>> Closing Gripper...\n";
             
             // 1. ATTACH THE OBJECT FIRST so the Allowed Collision Matrix ignores the fingers
-            if (current_marker_id >= 1 && current_marker_id <= 5 && attached_tube.empty()) {
+            if (current_marker_id >= 1 && current_marker_id <= 6 && attached_tube.empty()) {
                 std::string tube_id = "tube_" + std::to_string(current_marker_id);
                 
                 std::vector<std::string> touch_links; 
@@ -279,6 +351,9 @@ int main(int argc, char * argv[])
                 if (gripper_jmg) {
                     touch_links = gripper_jmg->getLinkModelNames();
                 }
+                
+                // Pause dynamic updates for this tube
+                attached_marker_id.store(current_marker_id); 
                 
                 // This updates the ACM so the fingers can intersect the tube's geometry
                 arm_interface.attachObject(tube_id, arm_interface.getEndEffectorLink(), touch_links);
@@ -299,6 +374,7 @@ int main(int argc, char * argv[])
                 if (!attached_tube.empty()) {
                     arm_interface.detachObject(attached_tube);
                     attached_tube = "";
+                    attached_marker_id.store(-1);
                 }
             }
             continue;
@@ -347,17 +423,21 @@ int main(int argc, char * argv[])
                         std::string target_frame = "marker_" + std::to_string(marker_id);
                         geometry_msgs::msg::TransformStamped t = tf_buffer->lookupTransform(
                             "marker_base", target_frame, tf2::TimePointZero);
-                        tx = t.transform.translation.x + 0.0;
-                        ty = t.transform.translation.y + 0.0;
-                        tz = 0.15; 
+                            
+                        // Target exactly 10cm behind the marker location
+                        tx = t.transform.translation.x;
+                        ty = t.transform.translation.y + 0.07; 
+                        
+                        // Set arm target height safely above the table/marker for grabbing
+                        tz = t.transform.translation.z + 0.13; 
                     } catch (const tf2::TransformException & ex) {
                         std::cout << "    [-] Falling back to hardcoded positions\n";
-                        if (marker_id == 1) { tx = -0.19; ty = -0.15; tz = 0.1; } 
-                        else if (marker_id == 2) { tx = -0.1; ty = -0.17; tz = 0.1; } 
-                        else if (marker_id == 3) { tx = 0.0; ty = -0.21; tz = 0.1; } 
-                        else if (marker_id == 4) { tx = 0.1; ty = -0.17; tz = 0.1; } 
-                        else if (marker_id == 5) { tx = 0.19; ty = -0.15; tz = 0.1; } 
-                        else if (marker_id == 6) { tx = -0.19; ty = -0.06; tz = 0.2; } 
+                        if (marker_id == 1) { tx = -0.19; ty = -0.20; tz = 0.15; } 
+                        else if (marker_id == 2) { tx = -0.10; ty = -0.24; tz = 0.15; } 
+                        else if (marker_id == 3) { tx =  0.00; ty = -0.28; tz = 0.15; } 
+                        else if (marker_id == 4) { tx =  0.10; ty = -0.24; tz = 0.15; } 
+                        else if (marker_id == 5) { tx =  0.19; ty = -0.20; tz = 0.15; } 
+                        else if (marker_id == 6) { tx = -0.19; ty = -0.02; tz = 0.20; } 
                         else {
                             continue; 
                         }
@@ -371,7 +451,9 @@ int main(int argc, char * argv[])
             if (!(ss >> tx >> ty >> tz)) continue;
         }
 
-        // SIMPLE OMPL MOVEMENT
+        // ---------------------------------------------------------
+        // THE NEW, SINGLE-STEP OMPL MOVEMENT WITH RECOVERY LOGIC
+        // ---------------------------------------------------------
         
         std::cout << "\n--- MOVING TO TARGET Z=" << tz << " ---\n";
         
@@ -390,8 +472,8 @@ int main(int argc, char * argv[])
         ocm.header.frame_id = arm_interface.getPlanningFrame();
         ocm.orientation = target_pose.orientation;
         ocm.absolute_x_axis_tolerance = M_PI; 
-        ocm.absolute_y_axis_tolerance = 0.4;
-        ocm.absolute_z_axis_tolerance = 0.4; 
+        ocm.absolute_y_axis_tolerance = 0.3;
+        ocm.absolute_z_axis_tolerance = 0.3; 
         ocm.weight = 1.0;
 
         moveit_msgs::msg::Constraints constraints;
