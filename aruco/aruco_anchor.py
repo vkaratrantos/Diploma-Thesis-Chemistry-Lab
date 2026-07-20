@@ -14,7 +14,7 @@ class ArucoAnchor(Node):
         self.get_logger().info("--- Dynamic Camera System Started (With Memory) ---")
 
         # --- ΡΥΘΜΙΣΕΙΣ ---
-        self.ANCHOR_ID = 1
+        self.ANCHOR_ID = 7
         self.MARKER_SIZE = 0.03 
         
         # --- ΝΕΟ: ΜΝΗΜΗ ΤΩΝ MARKERS ---
@@ -59,14 +59,39 @@ class ArucoAnchor(Node):
 
             for i in range(len(ids)):
                 current_id = ids[i][0]
+                new_rvec = rvecs[i]
+                new_tvec = tvecs[i]
                 
-                # Αποθηκεύουμε/Ανανεώνουμε την τελευταία γνωστή θέση στη μνήμη
-                self.last_known_poses[current_id] = (rvecs[i], tvecs[i])
+                # Μεταβλητές για να κρατήσουμε την τελική θέση που θα ζωγραφίσουμε
+                final_rvec = new_rvec
+                final_tvec = new_tvec
 
+                # NEW FILTERED CODE
+                if current_id in self.last_known_poses:
+                    old_rvec, old_tvec = self.last_known_poses[current_id]
+    
+                    # 1. Calculate how far the marker "moved" in meters
+                    distance = np.linalg.norm(new_tvec - old_tvec)
+    
+                    # 2. THE DEADBAND: If it moved less than 3mm, use the old pose (ignore noise)
+                    if distance < 0.003:
+                        final_rvec = old_rvec
+                        final_tvec = old_tvec
+                    else:
+                        # 3. THE SMOOTHER: Blend the old and new positions
+                        alpha = 0.2  
+                        final_tvec = old_tvec * (1.0 - alpha) + new_tvec * alpha
+                        final_rvec = old_rvec * (1.0 - alpha) + new_rvec * alpha
+                        self.last_known_poses[current_id] = (final_rvec, final_tvec)
+                else:
+                    # First time seeing the marker, save it immediately
+                    self.last_known_poses[current_id] = (final_rvec, final_tvec)
+
+                # Σχεδιάζουμε τους άξονες χρησιμοποιώντας την ΦΙΛΤΡΑΡΙΣΜΕΝΗ θέση!
                 try:
-                    cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs, rvecs[i], tvecs[i], 0.03)
+                    cv2.drawFrameAxes(frame, self.camera_matrix, self.dist_coeffs, final_rvec, final_tvec, 0.03)
                 except AttributeError:
-                    cv2.aruco.drawAxis(frame, self.camera_matrix, self.dist_coeffs, rvecs[i], tvecs[i], 0.03)
+                    cv2.aruco.drawAxis(frame, self.camera_matrix, self.dist_coeffs, final_rvec, final_tvec, 0.03)
 
         # 2. Εκπομπή όλων των γνωστών θέσεων (από τη μνήμη) στο ROS
         for m_id, (rvec, tvec) in self.last_known_poses.items():
