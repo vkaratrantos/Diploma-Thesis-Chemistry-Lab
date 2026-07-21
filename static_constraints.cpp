@@ -54,13 +54,12 @@ void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buff
     std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
 
     // TABLE SURFACE COLLISION OBJECT
-    
     moveit_msgs::msg::CollisionObject table;
     table.id = "table_base";
     table.header.frame_id = frame_id;
     table.primitives.resize(1);
     table.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
-    table.primitives[0].dimensions = {1.0, 1.0, 0.04}; 
+    table.primitives[0].dimensions = {1.5, 1.5, 0.04}; 
     table.primitive_poses.resize(1);
     table.primitive_poses[0].position.x = 0.0;
     table.primitive_poses[0].position.y = 0.0;
@@ -70,7 +69,6 @@ void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buff
     collision_objects.push_back(table);
 
     // 1ST BOX OBJECT
-    
     moveit_msgs::msg::CollisionObject wall;
     wall.id = "obstacle_box";
     wall.header.frame_id = frame_id;
@@ -86,42 +84,23 @@ void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buff
     collision_objects.push_back(wall);
 
     // 2ND BOX OBJECT
-    
     moveit_msgs::msg::CollisionObject wall2;
     wall2.id = "obstacle_box_2";
     wall2.header.frame_id = frame_id;
     wall2.primitives.resize(1);
     wall2.primitives[0].type = shape_msgs::msg::SolidPrimitive::BOX;
-    wall2.primitives[0].dimensions = { 0.2, 0.4, 0.2 };
+    wall2.primitives[0].dimensions = { 0.4, 0.2, 0.3 };
     wall2.primitive_poses.resize(1);
-    wall2.primitive_poses[0].position.x = -0.4;
+    wall2.primitive_poses[0].position.x = -0.6;
     wall2.primitive_poses[0].position.y = 0.1;
     wall2.primitive_poses[0].position.z = 0.03;   
     wall2.primitive_poses[0].orientation.w = 1.0;
     wall2.operation = wall2.ADD;
     collision_objects.push_back(wall2);
     
-    // MIXER OBJECT
-    
-    moveit_msgs::msg::CollisionObject mixer;
-    mixer.id = "mixer";
-    mixer.header.frame_id = frame_id;
-    mixer.primitives.resize(1);
-    mixer.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
-    mixer.primitives[0].dimensions = {0.17, 0.06}; // {HEIGHT, RADIUS}
-    mixer.primitive_poses.resize(1);
-    mixer.primitive_poses[0].position.x = -0.32;
-    mixer.primitive_poses[0].position.y = -0.15;
-    mixer.primitive_poses[0].position.z = 0.06; 
-    mixer.primitive_poses[0].orientation.w = 1.0;
-    mixer.operation = mixer.ADD;
-    collision_objects.push_back(mixer);
-    
-    // 6 DYNAMIC TEST TUBES (13cm height, 1.2cm diameter)
-    // We dynamically generate them 4cm behind markers 1-6
     // 5 DYNAMIC TEST TUBES (13cm height, 1.2cm diameter)
-    for (int i = 1; i <= 5; ++i) { // <--- CHANGED TO 5
-        double tube_x = 0.0, tube_y = 0.0, tube_z = 0.055;
+    for (int i = 1; i <= 5; ++i) { 
+        double tube_x = 0.0, tube_y = 0.0, tube_z = 0.075; // Table surface + half height
         bool tf_found = false;
         
         try {
@@ -160,7 +139,7 @@ void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buff
     }
 
     // DYNAMIC MIXER (Tied to marker_6)
-    double mixer_x = -0.19, mixer_y = -0.06; // Fallback
+    double mixer_x = -0.32, mixer_y = -0.06; // Fallback
     try {
         geometry_msgs::msg::TransformStamped t = tf_buffer.lookupTransform(
             "marker_base", "marker_6", tf2::TimePointZero);
@@ -177,8 +156,7 @@ void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buff
     mixer.primitive_poses.resize(1);
     mixer.primitive_poses[0].position.x = mixer_x;
     mixer.primitive_poses[0].position.y = mixer_y;
-    // Perfect Z for a 17cm cylinder sitting on a -0.01m table surface (-0.01 + 0.085)
-    mixer.primitive_poses[0].position.z = 0.075; 
+    mixer.primitive_poses[0].position.z = 0.095; // Table surface (0.01) + half height (0.085)
     mixer.primitive_poses[0].orientation.w = 1.0;
     mixer.operation = mixer.ADD;
     collision_objects.push_back(mixer);
@@ -231,8 +209,8 @@ int main(int argc, char * argv[])
     arm_interface.setPlanningTime(10.0);
     
     arm_interface.setNumPlanningAttempts(5);
-    arm_interface.setWorkspace(-0.5, -0.5, -0.05, 0.5, 0.5, 0.6);
-    arm_interface.setGoalPositionTolerance(0.01);
+    arm_interface.setWorkspace(-1.0, -1.0, -0.1, 1.0, 1.0, 1.0);
+    arm_interface.setGoalPositionTolerance(0.12);
     arm_interface.setGoalOrientationTolerance(0.1);
 
     geometry_msgs::msg::Pose start_pose;
@@ -290,7 +268,7 @@ int main(int argc, char * argv[])
             int currently_held_id = attached_marker_id.load();
 
             // Update Tubes 1-5
-            for (int i = 1; i <= 5; ++i) { // <--- CHANGED TO 5
+            for (int i = 1; i <= 5; ++i) {
                 if (i == currently_held_id) continue;
                 try {
                     std::string target_frame = "marker_" + std::to_string(i);
@@ -305,8 +283,8 @@ int main(int argc, char * argv[])
                     tube.primitives[0].dimensions = {0.13, 0.012}; 
                     tube.primitive_poses.resize(1);
                     tube.primitive_poses[0].position.x = t.transform.translation.x;
-                    tube.primitive_poses[0].position.y = t.transform.translation.y + 0.02;
-                    tube.primitive_poses[0].position.z = 0.055;
+                    tube.primitive_poses[0].position.y = t.transform.translation.y + 0.;
+                    tube.primitive_poses[0].position.z = 0.075;
                     tube.primitive_poses[0].orientation.w = 1.0;
                     tube.operation = tube.ADD; 
                     update_objects.push_back(tube);
@@ -319,20 +297,19 @@ int main(int argc, char * argv[])
                     "marker_base", "marker_6", tf2::TimePointZero);
 
                 moveit_msgs::msg::CollisionObject dyn_mixer;
-                dynamic_mixer.id = "mixer";
-                dynamic_mixer.header.frame_id = arm_interface.getPlanningFrame();
-                dynamic_mixer.primitives.resize(1);
-                dynamic_mixer.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
-                dynamic_mixer.primitives[0].dimensions = {0.17, 0.06}; 
-                dynamic_mixer.primitive_poses.resize(1);
-                dynamic_mixer.primitive_poses[0].position.x = t.transform.translation.x;
-                dynamic_mixer.primitive_poses[0].position.y = t.transform.translation.y;
-                dynamic_mixer.primitive_poses[0].position.z = 0.075;
-                dynamic_mixer.primitive_poses[0].orientation.w = 1.0;
-                dynamic_mixer.operation = dynamic_mixer.ADD; 
-                update_objects.push_back(dynamic_mixer);
+                dyn_mixer.id = "mixer";
+                dyn_mixer.header.frame_id = arm_interface.getPlanningFrame();
+                dyn_mixer.primitives.resize(1);
+                dyn_mixer.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
+                dyn_mixer.primitives[0].dimensions = {0.17, 0.06}; 
+                dyn_mixer.primitive_poses.resize(1);
+                dyn_mixer.primitive_poses[0].position.x = t.transform.translation.x;
+                dyn_mixer.primitive_poses[0].position.y = t.transform.translation.y;
+                dyn_mixer.primitive_poses[0].position.z = 0.095;
+                dyn_mixer.primitive_poses[0].orientation.w = 1.0;
+                dyn_mixer.operation = dyn_mixer.ADD; 
+                update_objects.push_back(dyn_mixer);
             } catch (...) { }
-            }
 
             if (!update_objects.empty()) {
                 dynamic_scene_interface.applyCollisionObjects(update_objects);
@@ -384,6 +361,23 @@ int main(int argc, char * argv[])
             if (current_marker_id >= 1 && current_marker_id <= 5 && attached_tube.empty()) {
                 std::string tube_id = "tube_" + std::to_string(current_marker_id);
                 
+                // === RESTORE THE TUBE BEFORE GRABBING ===
+                geometry_msgs::msg::Pose current_eef_pose = arm_interface.getCurrentPose().pose;
+                moveit_msgs::msg::CollisionObject restored_tube;
+                restored_tube.id = tube_id;
+                restored_tube.header.frame_id = arm_interface.getPlanningFrame();
+                restored_tube.primitives.resize(1);
+                restored_tube.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
+                restored_tube.primitives[0].dimensions = {0.13, 0.012}; 
+                restored_tube.primitive_poses.resize(1);
+                restored_tube.primitive_poses[0].position.x = current_eef_pose.position.x;
+                restored_tube.primitive_poses[0].position.y = current_eef_pose.position.y;
+                restored_tube.primitive_poses[0].position.z = 0.075; 
+                restored_tube.primitive_poses[0].orientation.w = 1.0;
+                restored_tube.operation = restored_tube.ADD; 
+                dynamic_scene_interface.applyCollisionObject(restored_tube);
+                rclcpp::sleep_for(std::chrono::milliseconds(100));
+
                 std::vector<std::string> touch_links; 
                 const moveit::core::JointModelGroup* gripper_jmg = gripper_interface.getRobotModel()->getJointModelGroup("gripper");
                 if (gripper_jmg) {
@@ -454,27 +448,34 @@ int main(int argc, char * argv[])
             std::stringstream ss(line.substr(1));
             if (ss >> marker_id) {
                 current_marker_id = marker_id;
+
                 if (marker_id == 7) {
                     tx = 0.0; ty = -0.065; tz = 0.20;
                 } else {
                     try {
                         std::string target_frame = "marker_" + std::to_string(marker_id);
                         geometry_msgs::msg::TransformStamped t = tf_buffer->lookupTransform(
-                            "marker_base", target_frame, tf2::TimePointZero);
+                            arm_interface.getPlanningFrame(), target_frame, tf2::TimePointZero);
                             
-                        // Target exactly 10cm behind the marker location
                         tx = t.transform.translation.x;
-                        ty = t.transform.translation.y + 0.02; 
+
+                        if (marker_id == 6) {
+                            // Mixer logic: Target exact center, stay high above it
+                            ty = t.transform.translation.y; 
+                            tz = 0.20; 
+                        } else {
+                            // Tube logic: Offset behind marker, target lower grab height
+                            ty = t.transform.translation.y + 0.12; 
+                            tz = 0.11; 
+                        }
                         
-                        // Set arm target height safely above the table/marker for grabbing
-                        tz = 0.13; 
                     } catch (const tf2::TransformException & ex) {
                         std::cout << "    [-] Falling back to hardcoded positions\n";
-                        if (marker_id == 1) { tx = -0.19; ty = -0.20; tz = 0.15; } 
-                        else if (marker_id == 2) { tx = -0.10; ty = -0.24; tz = 0.15; } 
-                        else if (marker_id == 3) { tx =  0.00; ty = -0.28; tz = 0.15; } 
-                        else if (marker_id == 4) { tx =  0.10; ty = -0.24; tz = 0.15; } 
-                        else if (marker_id == 5) { tx =  0.19; ty = -0.20; tz = 0.15; } 
+                        if (marker_id == 1) { tx = -0.19; ty = -0.20; tz = 0.1; } 
+                        else if (marker_id == 2) { tx = -0.10; ty = -0.18; tz = 0.1; } 
+                        else if (marker_id == 3) { tx =  0.00; ty = -0.22; tz = 0.1; } 
+                        else if (marker_id == 4) { tx =  0.10; ty = -0.18; tz = 0.1; } 
+                        else if (marker_id == 5) { tx =  0.19; ty = -0.14; tz = 0.1; } 
                         else if (marker_id == 6) { tx = -0.19; ty = -0.02; tz = 0.20; } 
                         else {
                             continue; 
