@@ -145,12 +145,12 @@ void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buff
 
     // DYNAMIC MIXER (Tied to marker_6)
     
-    double mixer_x = -0.36, mixer_y = -0.2; // Fallback
+    double mixer_x = -0.32, mixer_y = -0.23; // Fallback
     try {
         geometry_msgs::msg::TransformStamped t = tf_buffer.lookupTransform(
             "marker_base", "marker_6", tf2::TimePointZero);
         mixer_x = t.transform.translation.x;
-        mixer_y = t.transform.translation.y; // Assuming mixer is centered right on the marker
+        mixer_y = t.transform.translation.y + 0.1; // Assuming mixer is centered right on the marker
     } catch (...) {}
 
     moveit_msgs::msg::CollisionObject mixer;
@@ -243,8 +243,8 @@ int main(int argc, char * argv[])
         return -1;
     }
 
-    arm_interface.setGoalPositionTolerance(0.01);
-    arm_interface.setGoalOrientationTolerance(0.01);
+    arm_interface.setGoalPositionTolerance(0.005);
+    arm_interface.setGoalOrientationTolerance(0.1);
 
     std::cout << "\n>>> Ready. Waiting for GUI commands on '/gui_commands'...\n";
 
@@ -520,8 +520,8 @@ int main(int argc, char * argv[])
         ocm.header.frame_id = arm_interface.getPlanningFrame();
         ocm.orientation = target_pose.orientation;
         ocm.absolute_x_axis_tolerance = M_PI; 
-        ocm.absolute_y_axis_tolerance = 0.7;
-        ocm.absolute_z_axis_tolerance = 0.7; 
+        ocm.absolute_y_axis_tolerance = 0.5;
+        ocm.absolute_z_axis_tolerance = 0.5; 
         ocm.weight = 1.0;
 
         moveit_msgs::msg::Constraints constraints;
