@@ -38,7 +38,7 @@ static constexpr double ACC_SCALE_LIQUID   = 0.1;
 
 // MOTION VARIABLES
 
-static constexpr int    STATE_SETTLE_MS    = 500;   
+static constexpr int    STATE_SETTLE_MS    = 500;
 
 // QUEUE
 
@@ -48,12 +48,14 @@ std::mutex queue_mutex;
 // COLLISION OBJECTS
 
 // Modified to accept tf_buffer so it can spawn tubes relative to live markers
+
 void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buffer) {
 
     moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
     std::vector<moveit_msgs::msg::CollisionObject> collision_objects;
 
     // TABLE SURFACE COLLISION OBJECT
+    
     moveit_msgs::msg::CollisionObject table;
     table.id = "table_base";
     table.header.frame_id = frame_id;
@@ -69,6 +71,7 @@ void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buff
     collision_objects.push_back(table);
 
     // 1ST BOX OBJECT
+
     moveit_msgs::msg::CollisionObject wall;
     wall.id = "obstacle_box";
     wall.header.frame_id = frame_id;
@@ -84,6 +87,7 @@ void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buff
     collision_objects.push_back(wall);
 
     // 2ND BOX OBJECT
+
     moveit_msgs::msg::CollisionObject wall2;
     wall2.id = "obstacle_box_2";
     wall2.header.frame_id = frame_id;
@@ -99,8 +103,9 @@ void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buff
     collision_objects.push_back(wall2);
     
     // 5 DYNAMIC TEST TUBES (13cm height, 1.2cm diameter)
+
     for (int i = 1; i <= 5; ++i) { 
-        double tube_x = 0.0, tube_y = 0.0, tube_z = 0.075; // Table surface + half height
+        double tube_x = 0.0, tube_y = 0.0, tube_z = 0.07; // Table surface + half height
         bool tf_found = false;
         
         try {
@@ -116,11 +121,11 @@ void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buff
         }
 
         if (!tf_found) {
-            if (i == 1) { tube_x = -0.19; tube_y = -0.24; }
-            else if (i == 2) { tube_x = -0.10; tube_y = -0.28; }
-            else if (i == 3) { tube_x =  0.00; tube_y = -0.32; }
-            else if (i == 4) { tube_x =  0.10; tube_y = -0.28; }
-            else if (i == 5) { tube_x =  0.19; tube_y = -0.24; }
+            if (i == 1) { tube_x = -0.17; tube_y = -0.345; }
+            else if (i == 2) { tube_x = -0.085; tube_y = -0.345; }
+            else if (i == 3) { tube_x =  0.00; tube_y = -0.345; }
+            else if (i == 4) { tube_x =  0.085; tube_y = -0.345; }
+            else if (i == 5) { tube_x =  0.17; tube_y = -0.345; }
         }
 
         moveit_msgs::msg::CollisionObject tube;
@@ -139,7 +144,8 @@ void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buff
     }
 
     // DYNAMIC MIXER (Tied to marker_6)
-    double mixer_x = -0.32, mixer_y = -0.06; // Fallback
+    
+    double mixer_x = -0.36, mixer_y = -0.2; // Fallback
     try {
         geometry_msgs::msg::TransformStamped t = tf_buffer.lookupTransform(
             "marker_base", "marker_6", tf2::TimePointZero);
@@ -156,7 +162,7 @@ void setupCollisionObjects(const std::string& frame_id, tf2_ros::Buffer& tf_buff
     mixer.primitive_poses.resize(1);
     mixer.primitive_poses[0].position.x = mixer_x;
     mixer.primitive_poses[0].position.y = mixer_y;
-    mixer.primitive_poses[0].position.z = 0.095; // Table surface (0.01) + half height (0.085)
+    mixer.primitive_poses[0].position.z = 0.08; // Table surface (0.01) + half height (0.085)
     mixer.primitive_poses[0].orientation.w = 1.0;
     mixer.operation = mixer.ADD;
     collision_objects.push_back(mixer);
@@ -195,6 +201,7 @@ int main(int argc, char * argv[])
     rclcpp::sleep_for(std::chrono::seconds(2));
     
     // Pass the populated TF buffer into the setup function
+    
     setupCollisionObjects(arm_interface.getPlanningFrame(), *tf_buffer);
 
     tf2::Quaternion q_upright;
@@ -260,6 +267,7 @@ int main(int argc, char * argv[])
     // DYNAMIC COLLISION UPDATER
     // Runs automatically in the background executor thread
     // ---------------------------------------------------------
+    
     moveit::planning_interface::PlanningSceneInterface dynamic_scene_interface;
     auto dynamic_updater = node->create_wall_timer(
         std::chrono::milliseconds(500), 
@@ -284,7 +292,7 @@ int main(int argc, char * argv[])
                     tube.primitive_poses.resize(1);
                     tube.primitive_poses[0].position.x = t.transform.translation.x;
                     tube.primitive_poses[0].position.y = t.transform.translation.y + 0.;
-                    tube.primitive_poses[0].position.z = 0.075;
+                    tube.primitive_poses[0].position.z = 0.08;
                     tube.primitive_poses[0].orientation.w = 1.0;
                     tube.operation = tube.ADD; 
                     update_objects.push_back(tube);
@@ -292,6 +300,7 @@ int main(int argc, char * argv[])
             }
 
             // Update Mixer (Marker 6)
+    
             try {
                 geometry_msgs::msg::TransformStamped t = tf_buffer->lookupTransform(
                     "marker_base", "marker_6", tf2::TimePointZero);
@@ -301,11 +310,11 @@ int main(int argc, char * argv[])
                 dyn_mixer.header.frame_id = arm_interface.getPlanningFrame();
                 dyn_mixer.primitives.resize(1);
                 dyn_mixer.primitives[0].type = shape_msgs::msg::SolidPrimitive::CYLINDER;
-                dyn_mixer.primitives[0].dimensions = {0.17, 0.06}; 
+                dyn_mixer.primitives[0].dimensions = {0.17, 0.05}; 
                 dyn_mixer.primitive_poses.resize(1);
                 dyn_mixer.primitive_poses[0].position.x = t.transform.translation.x;
                 dyn_mixer.primitive_poses[0].position.y = t.transform.translation.y;
-                dyn_mixer.primitive_poses[0].position.z = 0.095;
+                dyn_mixer.primitive_poses[0].position.z = 0.07;
                 dyn_mixer.primitive_poses[0].orientation.w = 1.0;
                 dyn_mixer.operation = dyn_mixer.ADD; 
                 update_objects.push_back(dyn_mixer);
@@ -371,8 +380,8 @@ int main(int argc, char * argv[])
                 restored_tube.primitives[0].dimensions = {0.13, 0.012}; 
                 restored_tube.primitive_poses.resize(1);
                 restored_tube.primitive_poses[0].position.x = current_eef_pose.position.x;
-                restored_tube.primitive_poses[0].position.y = current_eef_pose.position.y;
-                restored_tube.primitive_poses[0].position.z = 0.075; 
+                restored_tube.primitive_poses[0].position.y = current_eef_pose.position.y - 0.125;
+                restored_tube.primitive_poses[0].position.z = 0.08; 
                 restored_tube.primitive_poses[0].orientation.w = 1.0;
                 restored_tube.operation = restored_tube.ADD; 
                 dynamic_scene_interface.applyCollisionObject(restored_tube);
@@ -449,7 +458,7 @@ int main(int argc, char * argv[])
             if (ss >> marker_id) {
                 current_marker_id = marker_id;
 
-                if (marker_id == 7) {
+                if (marker_id == 0) {
                     tx = 0.0; ty = -0.065; tz = 0.20;
                 } else {
                     try {
@@ -465,18 +474,18 @@ int main(int argc, char * argv[])
                             tz = 0.20; 
                         } else {
                             // Tube logic: Offset behind marker, target lower grab height
-                            ty = t.transform.translation.y + 0.12; 
+                            ty = t.transform.translation.y + 0.155; 
                             tz = 0.11; 
                         }
                         
                     } catch (const tf2::TransformException & ex) {
                         std::cout << "    [-] Falling back to hardcoded positions\n";
-                        if (marker_id == 1) { tx = -0.19; ty = -0.20; tz = 0.1; } 
-                        else if (marker_id == 2) { tx = -0.10; ty = -0.18; tz = 0.1; } 
+                        if (marker_id == 1) { tx = -0.17; ty = -0.22; tz = 0.1; } 
+                        else if (marker_id == 2) { tx = -0.10; ty = -0.22; tz = 0.1; } 
                         else if (marker_id == 3) { tx =  0.00; ty = -0.22; tz = 0.1; } 
-                        else if (marker_id == 4) { tx =  0.10; ty = -0.18; tz = 0.1; } 
-                        else if (marker_id == 5) { tx =  0.19; ty = -0.14; tz = 0.1; } 
-                        else if (marker_id == 6) { tx = -0.19; ty = -0.02; tz = 0.20; } 
+                        else if (marker_id == 4) { tx =  0.10; ty = -0.22; tz = 0.1; } 
+                        else if (marker_id == 5) { tx =  0.17; ty = -0.22; tz = 0.1; } 
+                        else if (marker_id == 6) { tx = -0.2; ty = -0.11; tz = 0.20; } 
                         else {
                             continue; 
                         }
@@ -511,8 +520,8 @@ int main(int argc, char * argv[])
         ocm.header.frame_id = arm_interface.getPlanningFrame();
         ocm.orientation = target_pose.orientation;
         ocm.absolute_x_axis_tolerance = M_PI; 
-        ocm.absolute_y_axis_tolerance = 0.3;
-        ocm.absolute_z_axis_tolerance = 0.3; 
+        ocm.absolute_y_axis_tolerance = 0.7;
+        ocm.absolute_z_axis_tolerance = 0.7; 
         ocm.weight = 1.0;
 
         moveit_msgs::msg::Constraints constraints;
@@ -534,13 +543,9 @@ int main(int argc, char * argv[])
 
             // 1. APPLY ORIENTATION CONSTRAINTS ONLY FOR THE MIXER (MARKER 6)
             if (!attached_tube.empty() && current_marker_id == 6) {
-                if (attempt == 1) std::cout << "    [*] Holding tube & moving to mixer: Applying upright constraints.\n";
+                std::cout << "    [*] Holding tube & moving to mixer: Applying upright constraints.\n";
                 arm_interface.setPathConstraints(constraints);
-            } else {
-                if (attempt == 1) std::cout << "    [*] Moving freely without orientation constraints.\n";
-                arm_interface.clearPathConstraints();
             }
-
             moveit::planning_interface::MoveGroupInterface::Plan unified_plan;
             
             if (arm_interface.plan(unified_plan) == moveit::core::MoveItErrorCode::SUCCESS) {
