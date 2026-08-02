@@ -125,6 +125,11 @@ static constexpr double STANDOFF_TUBE  = 0.10;
 // IMPORTANT: CartesianOptions::free_axis defaults to the TCP frame's Z. Verify
 // that Z is the axis running along the tube on your robot before enabling this.
 static constexpr double TOOL_AXIS_FREEDOM = M_PI;
+
+// How far the tube may tip from vertical during a carrying move, in radians.
+// 0.10 rad is about 6 degrees. Tighter is safer for the liquid but much harder
+// for OMPL to plan -- see the note on enforce_constrained_state_space below.
+static constexpr double TILT_TOLERANCE = 0.3;
 static constexpr double STANDOFF_MIXER = 0.12;
 
 // ---- Misc ------------------------------------------------------------------
@@ -824,6 +829,208 @@ static bool moveFreeSpace(MGI & mg,
     return mg.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS;
 }
 
+static moveit_msgs::msg::Constraints uprightConstraint(
+    const std::string & tcp_link,
+    const std::string & planning_frame,
+    const geometry_msgs::msg::Quaternion & upright,
+    double tilt_tolerance = TILT_TOLERANCE)
+{
+    moveit_msgs::msg::OrientationConstraint ocm;
+    ocm.link_name                 = tcp_link;
+    ocm.header.frame_id           = planning_frame;
+    ocm.orientation               = upright;
+    ocm.absolute_x_axis_tolerance = tilt_tolerance;   // tipping -- keep tight
+    ocm.absolute_y_axis_tolerance = tilt_tolerance;   // tipping -- keep tight
+    ocm.absolute_z_axis_tolerance = M_PI;             // roll about the tube -- free
+    ocm.weight                    = 1.0;
+
+    // ROTATION_VECTOR handles "one axis completely free" far better than the
+    // default XYZ Euler decomposition, which goes singular when one tolerance
+    // is pi. If this field does not exist on your moveit_msgs version, delete
+    // this line -- everything else still works.
+    ocm.parameterization = moveit_msgs::msg::OrientationConstraint::ROTATION_VECTOR;
+
+    moveit_msgs::msg::Constraints c;
+    c.orientation_constraints.push_back(ocm);
+    return c;
+}
+
+// ---------------------------------------------------------------------------
+// Orientation path constraint for carrying a tube.
+//
+// AXIS CONVENTION: the free axis here is Z, matching CartesianOptions::free_axis.
+// Rotation about the tube's long axis does not spill anything, so it is left
+// free; tipping (X and Y) is what must stay tight. The previous version had X
+// free and Y/Z at 0.25 rad, which is the opposite convention and would have
+// permitted a 14-degree tip while forbidding harmless roll.
+//
+// NOTE ON PLANNING SPEED: by default OMPL enforces path constraints by
+// rejection sampling -- it samples states and discards ones that violate the
+// constraint. At a 6-degree tolerance almost every sample is discarded and
+// planning becomes very slow or fails. If you need tolerances this tight, set
+//     enforce_constrained_state_space: true
+// for arm_group in ompl_planning.yaml, which switches OMPL to a projection-based
+// constrained state space instead. Without that, loosen TILT_TOLERANCE to ~0.25.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Accessor for the trajectory inside a Plan (the field was renamed after Humble).
+// ---------------------------------------------------------------------------
+static const moveit_msgs::msg::RobotTrajectory & planTraj(const MGI::Plan & p)
+{
+#ifdef MOVEIT_JAZZY_OR_NEWER
+    return p.trajectory;
+#else
+    return p.trajectory_;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Worst tilt of the tool axis away from its reference direction, over a whole
+// trajectory, in radians.
+//
+// This measures exactly the thing you care about -- how far the tube leans from
+// vertical -- and it is roll-invariant, so spin about the tube axis costs
+// nothing. That makes it a much better test than Euler-angle tolerances, which
+// go singular precisely when one axis is free.
+// ---------------------------------------------------------------------------
+static double maxTiltAlongTrajectory(MGI & mg,
+                                     const moveit_msgs::msg::RobotTrajectory & traj_msg,
+                                     const geometry_msgs::msg::Quaternion & reference,
+                                     const Eigen::Vector3d & tool_axis = Eigen::Vector3d::UnitZ())
+{
+    auto current = mg.getCurrentState(2.0);
+    if (!current) return 0.0;
+
+    robot_trajectory::RobotTrajectory rt(mg.getRobotModel(), mg.getName());
+    rt.setRobotTrajectoryMsg(*current, traj_msg);
+
+    const Eigen::Quaterniond q_ref(reference.w, reference.x, reference.y, reference.z);
+    const Eigen::Vector3d ref_axis = (q_ref.normalized() * tool_axis).normalized();
+
+    const std::string tip = mg.getEndEffectorLink();
+    double worst = 0.0;
+
+    for (size_t i = 0; i < rt.getWayPointCount(); ++i)
+    {
+        const Eigen::Vector3d a =
+            (rt.getWayPoint(i).getGlobalLinkTransform(tip).linear() * tool_axis).normalized();
+        const double c = std::max(-1.0, std::min(1.0, a.dot(ref_axis)));
+        worst = std::max(worst, std::acos(c));
+    }
+    return worst;
+}
+
+// ---------------------------------------------------------------------------
+// Free-space move that keeps the tool upright, with a three-rung ladder.
+//
+//   1. OMPL with the tight constraint
+//   2. OMPL with a loosened constraint
+//   3. OMPL with NO constraint, then verify the resulting trajectory and reject
+//      it if the tube would ever tip past hard_limit
+//
+// Rung 3 is the important one. Constrained sampling is expensive because OMPL
+// throws away most of what it generates; planning freely and then checking the
+// answer costs almost nothing, and an unconstrained plan is often perfectly
+// upright anyway. This is what fixes "it will not let me carry the tube back".
+// ---------------------------------------------------------------------------
+static bool moveFreeSpaceUpright(MGI & mg,
+                                 IkValidator & validator,
+                                 const geometry_msgs::msg::Pose & target,
+                                 double vel_scale,
+                                 double acc_scale,
+                                 const std::string & tcp_link,
+                                 const std::string & planning_frame,
+                                 double tight_tol = TILT_TOLERANCE,
+                                 double loose_tol = 0.5,
+                                 double hard_limit = 0.7)
+{
+    auto try_plan = [&](const moveit_msgs::msg::Constraints * c,
+                        const char * label) -> bool
+    {
+        mg.setStartStateToCurrentState();
+        mg.clearPoseTargets();
+        mg.setMaxVelocityScalingFactor(vel_scale);
+        mg.setMaxAccelerationScalingFactor(acc_scale);
+
+        if (c) mg.setPathConstraints(*c);
+        else   mg.clearPathConstraints();
+
+        if (!setNearestJointGoal(mg, validator, target))
+        {
+            std::cout << "    [" << label << "] no collision-free IK at the goal.\n";
+            return false;
+        }
+
+        MGI::Plan plan;
+        if (mg.plan(plan) != moveit::core::MoveItErrorCode::SUCCESS)
+        {
+            std::cout << "    [" << label << "] planning failed.\n";
+            return false;
+        }
+
+        // Verify the tilt regardless of which rung produced the plan -- a
+        // constraint that OMPL believes it satisfied is still worth checking.
+        const double tilt = maxTiltAlongTrajectory(mg, planTraj(plan), target.orientation);
+        std::cout << "    [" << label << "] ok, max tilt "
+                  << (tilt * 180.0 / M_PI) << " deg\n";
+
+        if (tilt > hard_limit)
+        {
+            std::cout << "    [" << label << "] rejected: exceeds the hard tilt limit of "
+                      << (hard_limit * 180.0 / M_PI) << " deg.\n";
+            return false;
+        }
+
+        return mg.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS;
+    };
+
+    const auto tight = uprightConstraint(tcp_link, planning_frame, target.orientation, tight_tol);
+    if (try_plan(&tight, "upright/tight")) { mg.clearPathConstraints(); return true; }
+
+    const auto loose = uprightConstraint(tcp_link, planning_frame, target.orientation, loose_tol);
+    if (try_plan(&loose, "upright/loose")) { mg.clearPathConstraints(); return true; }
+
+    std::cout << "    [*] Constrained planning failed both times; planning freely\n"
+                 "        and checking the result instead.\n";
+    const bool ok = try_plan(nullptr, "upright/verified");
+    mg.clearPathConstraints();
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Retry wrapper.
+//
+// Every stage of this pipeline is stochastic: random IK seeds, TRAC-IK's own
+// random restarts, RRTConnect's random tree, and a planning scene that moves
+// with the ArUco markers. When a target succeeds on the second or third manual
+// click, it is not luck -- it means the target is marginally feasible and a
+// different random draw found the way. This just does that automatically.
+//
+// Between attempts the arm has usually moved, so the next attempt seeds its IK
+// from a different configuration. That is most of why retrying works.
+// ---------------------------------------------------------------------------
+template <typename F>
+static bool withRetries(const char * what, int attempts, F && fn)
+{
+    for (int i = 1; i <= attempts; ++i)
+    {
+        if (fn())
+        {
+            if (i > 1)
+                std::cout << "    [+] " << what << " succeeded on attempt " << i << ".\n";
+            return true;
+        }
+        if (i < attempts)
+        {
+            std::cout << "    [retry] " << what << " failed (attempt " << i
+                      << " of " << attempts << "); re-seeding...\n";
+            rclcpp::sleep_for(std::chrono::milliseconds(400));
+        }
+    }
+    std::cout << "    [-] " << what << " failed all " << attempts << " attempts.\n";
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Backward-planned approach:
 //   1. find a collision-free IK solution at the GRASP pose
@@ -839,7 +1046,10 @@ static bool approachTarget(MGI & mg,
                            double standoff_z,
                            double vel_scale,
                            double acc_scale,
-                           double free_axis_tolerance = 0.0)
+                           double free_axis_tolerance = 0.0,
+                           bool carrying = false,
+                           const std::string & tcp_link = "",
+                           const std::string & planning_frame = "")
 {
     geometry_msgs::msg::Pose standoff = target;
     standoff.position.z += standoff_z;
@@ -875,24 +1085,43 @@ static bool approachTarget(MGI & mg,
     }
 
     // ---- Step 3: transit ----------------------------------------------------
-    mg.setStartStateToCurrentState();
-    mg.clearPoseTargets();
-    mg.setJointValueTarget(standoff_state);
-    mg.setMaxVelocityScalingFactor(vel_scale);
-    mg.setMaxAccelerationScalingFactor(acc_scale);
-
     std::cout << "    [1/2] Transit to standoff (z+" << standoff_z << ")...\n";
-    MGI::Plan plan;
-    if (mg.plan(plan) != moveit::core::MoveItErrorCode::SUCCESS)
+
+    if (carrying)
     {
-        std::cout << "    [-] Transit planning failed even with a validated goal. "
-                     "The start state may itself be in collision -- check RViz.\n";
-        return false;
+        // Carrying a tube means an orientation path constraint, and OMPL
+        // enforces those by rejection sampling -- at a tight tolerance it
+        // discards nearly every state it generates and reports failure after
+        // burning the whole planning budget. This is why an empty gripper
+        // plans instantly and a loaded one does not. The ladder falls back to
+        // planning freely and verifying the tilt afterwards.
+        if (!moveFreeSpaceUpright(mg, validator, standoff, vel_scale, acc_scale,
+                                  tcp_link, planning_frame))
+        {
+            std::cout << "    [-] Constrained transit to standoff failed.\n";
+            return false;
+        }
     }
-    if (mg.execute(plan) != moveit::core::MoveItErrorCode::SUCCESS)
+    else
     {
-        std::cout << "    [-] Transit execution failed.\n";
-        return false;
+        mg.setStartStateToCurrentState();
+        mg.clearPoseTargets();
+        mg.setJointValueTarget(standoff_state);
+        mg.setMaxVelocityScalingFactor(vel_scale);
+        mg.setMaxAccelerationScalingFactor(acc_scale);
+
+        MGI::Plan plan;
+        if (mg.plan(plan) != moveit::core::MoveItErrorCode::SUCCESS)
+        {
+            std::cout << "    [-] Transit planning failed even with a validated goal. "
+                         "The start state may itself be in collision -- check RViz.\n";
+            return false;
+        }
+        if (mg.execute(plan) != moveit::core::MoveItErrorCode::SUCCESS)
+        {
+            std::cout << "    [-] Transit execution failed.\n";
+            return false;
+        }
     }
     waitForStateSettle(mg, 200);
 
@@ -906,6 +1135,39 @@ static bool approachTarget(MGI & mg,
     }
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Vertical ascent -- the mirror of the descent inside approachTarget().
+//
+// Call this immediately after closing the gripper (so the tube clears the rack
+// before the arm reorients) and again after releasing it (so the fingers clear
+// the tube before any free-space move). Both are the moments where a normal
+// OMPL move would swing the wrist and knock over a neighbour.
+//
+// Uses the same three-rung ladder as the descent, so it degrades gracefully
+// instead of failing outright.
+// ---------------------------------------------------------------------------
+static bool retreatVertical(MGI & mg,
+                            IkValidator & validator,
+                            double lift_z,
+                            double vel_scale,
+                            double acc_scale,
+                            double free_axis_tolerance = 0.0)
+{
+    geometry_msgs::msg::Pose up = mg.getCurrentPose().pose;
+    up.position.z += lift_z;
+
+    std::cout << "    [ascent] lifting " << (lift_z * 1000.0) << " mm...\n";
+    if (!moveLinear(mg, validator, up, vel_scale, acc_scale, free_axis_tolerance))
+    {
+        std::cout << "    [-] Ascent incomplete. The arm is still low -- do not\n"
+                     "        issue a free-space move until this is resolved.\n";
+        return false;
+    }
+    return true;
+}
+
+
 
 // ============================================================================
 //  MOVEIT TASK CONSTRUCTOR PIPELINE
@@ -1079,22 +1341,11 @@ static bool executeLiquidTransferTask(int target_marker,
         s->setGroup("arm_group");
         s->setGoal(pour_pose);
 
-        // VERIFY THIS: the free axis must be the one the tube is symmetric
-        // about. Free the wrong axis and you either over-constrain (planning
-        // stalls) or the tube tips during transit. Your two earlier versions
-        // disagreed about which axis this is.
-        moveit_msgs::msg::OrientationConstraint ocm;
-        ocm.link_name                 = tcp_link;
-        ocm.header.frame_id           = planning_frame;
-        ocm.orientation               = q_upright_msg;
-        ocm.absolute_x_axis_tolerance = M_PI;    // <-- free axis
-        ocm.absolute_y_axis_tolerance = 0.25;
-        ocm.absolute_z_axis_tolerance = 0.25;
-        ocm.weight                    = 1.0;
-
-        moveit_msgs::msg::Constraints c;
-        c.orientation_constraints.push_back(ocm);
-        s->setPathConstraints(c);
+        // Same convention as the manual path: Z free (roll about the tube),
+        // X and Y tight (tipping). Kept in one helper so the two code paths
+        // cannot drift apart again.
+        s->setPathConstraints(
+            uprightConstraint(tcp_link, planning_frame, q_upright_msg));
 
         task.add(std::move(s));
     }
@@ -1325,10 +1576,15 @@ int main(int argc, char * argv[])
         {
             const double v = attached_tube.empty() ? VEL_SCALE_TRANSIT : VEL_SCALE_LIQUID;
             const double a = attached_tube.empty() ? ACC_SCALE_TRANSIT : ACC_SCALE_LIQUID;
-            if (moveFreeSpace(arm_interface, ik_validator, home_pose, v, a))
+            const bool ok = attached_tube.empty()
+                ? moveFreeSpace(arm_interface, ik_validator, home_pose, v, a)
+                : moveFreeSpaceUpright(arm_interface, ik_validator, home_pose, v, a,
+                                       tcp_link, planning_frame);
+            if (ok)
                 std::cout << ">>> Home.\n";
             else
                 std::cout << "    [-] Could not reach home.\n";
+            arm_interface.clearPathConstraints();
             waitForStateSettle(arm_interface);
             continue;
         }
@@ -1348,7 +1604,19 @@ int main(int argc, char * argv[])
                     arm_interface.detachObject(attached_tube);
                     std::cout << ">>> Detached " << attached_tube << ".\n";
                     attached_tube.clear();
+                    rclcpp::sleep_for(std::chrono::milliseconds(200));
+
+                    // Vertical ascent before anything else, so the fingers clear
+                    // the tube instead of dragging it out of the rack.
+                    waitForStateSettle(arm_interface, 200);
+                    if (!retreatVertical(arm_interface, ik_validator, LIFT_DIST,
+                                         VEL_SCALE_TRANSIT, ACC_SCALE_TRANSIT,
+                                         TOOL_AXIS_FREEDOM))
+                        std::cout << "    [!] Could not lift clear of the tube.\n";
+
+                    // Only now let the background updater track this tube again.
                     attached_marker_id.store(-1);
+                    waitForStateSettle(arm_interface, 200);
                 }
             }
             else
@@ -1403,6 +1671,23 @@ int main(int argc, char * argv[])
             if (gripper_interface.move() == moveit::core::MoveItErrorCode::SUCCESS)
             {
                 std::cout << ">>> Gripper closed.\n";
+
+                // Vertical ascent: clear the rack before the arm is allowed to
+                // reorient. Skipping this is how neighbouring tubes get knocked
+                // over -- the first thing a free-space move does is swing the
+                // wrist, and at this moment the tube is still between its
+                // neighbours.
+                if (!attached_tube.empty())
+                {
+                    waitForStateSettle(arm_interface, 200);
+                    if (!retreatVertical(arm_interface, ik_validator, LIFT_DIST,
+                                         VEL_SCALE_LIQUID, ACC_SCALE_LIQUID,
+                                         TOOL_AXIS_FREEDOM))
+                        std::cout << "    [!] Tube is grasped but still down in the rack.\n";
+                    else
+                        std::cout << ">>> Lifted clear of the rack.\n";
+                    waitForStateSettle(arm_interface, 200);
+                }
             }
             else
             {
@@ -1554,29 +1839,32 @@ int main(int argc, char * argv[])
         const double v = attached_tube.empty() ? VEL_SCALE_TRANSIT : VEL_SCALE_LIQUID;
         const double a = attached_tube.empty() ? ACC_SCALE_TRANSIT : ACC_SCALE_LIQUID;
 
-        // Keep the tube upright for the WHOLE transit, not just near the mixer.
-        if (!attached_tube.empty())
-        {
-            moveit_msgs::msg::OrientationConstraint ocm;
-            ocm.link_name                 = tcp_link;
-            ocm.header.frame_id           = planning_frame;
-            ocm.orientation               = target.orientation;
-            ocm.absolute_x_axis_tolerance = M_PI;    // free axis -- verify
-            ocm.absolute_y_axis_tolerance = 0.25;
-            ocm.absolute_z_axis_tolerance = 0.25;
-            ocm.weight                    = 1.0;
+        const bool carrying = !attached_tube.empty();
 
-            moveit_msgs::msg::Constraints c;
-            c.orientation_constraints.push_back(ocm);
-            arm_interface.setPathConstraints(c);
-        }
+        // Retries are not superstition: every stage here is stochastic (random
+        // IK seeds, TRAC-IK's own restarts, RRTConnect's tree, a scene that
+        // moves with the markers). A target that needs two or three tries is
+        // marginally feasible rather than wrong, and each attempt re-seeds from
+        // a different arm configuration.
+        const bool reached = withRetries("approach", 3, [&]() {
+            return approachTarget(arm_interface, ik_validator, target, standoff,
+                                  v, a, TOOL_AXIS_FREEDOM,
+                                  carrying, tcp_link, planning_frame);
+        });
 
-        if (!approachTarget(arm_interface, ik_validator, target, standoff, v, a,
-                           TOOL_AXIS_FREEDOM))
+        if (!reached)
         {
-            arm_interface.clearPathConstraints();
             std::cout << "    [!] RECOVERY: returning home...\n";
-            if (!moveFreeSpace(arm_interface, ik_validator, home_pose, VEL_SCALE_TRANSIT, ACC_SCALE_TRANSIT))
+            // Recovery used to drop the constraint entirely, which meant the
+            // arm was free to tip a full tube on the way back. Keep it upright,
+            // just with a looser tolerance so recovery itself can succeed.
+            const bool home_ok = carrying
+                ? moveFreeSpaceUpright(arm_interface, ik_validator, home_pose,
+                                       VEL_SCALE_LIQUID, ACC_SCALE_LIQUID,
+                                       tcp_link, planning_frame, 0.25, 0.45, 0.60)
+                : moveFreeSpace(arm_interface, ik_validator, home_pose,
+                                VEL_SCALE_TRANSIT, ACC_SCALE_TRANSIT);
+            if (!home_ok)
                 std::cout << "    [!] CRITICAL: could not reach home. Arm may be trapped.\n";
         }
         else
