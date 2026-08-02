@@ -33,8 +33,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
+
 #include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -44,12 +46,17 @@
 #include <moveit_msgs/msg/orientation_constraint.hpp>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
+
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>   // tf2::toMsg
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
+
+#include <Eigen/Geometry>
+
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit/planning_scene_monitor/planning_scene_monitor.h>
 #include <moveit/robot_model/joint_model_group.h>
 #include <moveit/robot_state/robot_state.h>
 #include <moveit/robot_trajectory/robot_trajectory.h>
@@ -78,13 +85,13 @@ using MGI = moveit::planning_interface::MoveGroupInterface;
 // ---- Speed scaling ---------------------------------------------------------
 static constexpr double VEL_SCALE_TRANSIT = 0.30;
 static constexpr double ACC_SCALE_TRANSIT = 0.10;
-static constexpr double VEL_SCALE_LIQUID  = 0.15;
+static constexpr double VEL_SCALE_LIQUID  = 0.15;   // slower when carrying
 static constexpr double ACC_SCALE_LIQUID  = 0.05;
 
 // ---- Table -----------------------------------------------------------------
 static constexpr double TABLE_SIZE_XY   = 1.5;
 static constexpr double TABLE_THICKNESS = 0.04;
-static constexpr double TABLE_CENTER_Z  = -0.03;
+static constexpr double TABLE_CENTER_Z  = -0.03;    // -> top surface at z = -0.01
 
 // ---- Test tubes ------------------------------------------------------------
 static constexpr double TUBE_HEIGHT = 0.13;
@@ -110,6 +117,14 @@ static constexpr double POUR_Z         = 0.20;      // TCP height above the mixe
 static constexpr double APPROACH_DIST  = 0.10;      // vertical descent to grasp
 static constexpr double LIFT_DIST      = 0.12;      // vertical retreat after grasp
 static constexpr double STANDOFF_TUBE  = 0.10;
+
+// How much rotation about the tool axis the interpolator may invent when a
+// strict straight line fails. A test tube is a cylinder, so spin about its long
+// axis does not change the grasp -- that freedom is yours to spend.
+// Set to 0.0 if your gripper fingers are asymmetric or a cable would wrap.
+// IMPORTANT: CartesianOptions::free_axis defaults to the TCP frame's Z. Verify
+// that Z is the axis running along the tube on your robot before enabling this.
+static constexpr double TOOL_AXIS_FREEDOM = M_PI;
 static constexpr double STANDOFF_MIXER = 0.12;
 
 // ---- Misc ------------------------------------------------------------------
@@ -295,49 +310,104 @@ static void waitForStateSettle(MGI & iface, int ms = STATE_SETTLE_MS)
 
 // ============================================================================
 //  MOTION HELPERS (manual / non-MTC path)
+//
+//  Contains a hand-written Cartesian interpolator. The short version of what
+//  that is: your controller only accepts joint angles, but you want the tool
+//  tip to travel in a straight line. There is no closed-form answer, so the
+//  line gets chopped into small steps and IK is solved at each one.
+//
+//  MoveIt's computeCartesianPath() does the same thing but STOPS at the first
+//  step where IK fails -- that is where the "90.4762%" came from. This version
+//  retries with different seeds, tries small rotations about the tool axis,
+//  and halves the step size before giving up.
 // ============================================================================
 
-// Convert a pose goal into a joint goal seeded from the current configuration.
+// ---------------------------------------------------------------------------
+// Collision-aware IK.
 //
-// This is the fix for "the arm goes around itself". With 7 DOF, a pose goal is
-// a goal *region* and OMPL samples IK solutions from it -- so consecutive plans
-// can land in wildly different arm postures. Seeding IK from the current state
-// keeps the solution in the same branch, and RRTConnect then only has to bridge
-// two nearby configurations.
-static bool setNearestJointGoal(MGI & mg,
-                                const geometry_msgs::msg::Pose & pose,
-                                int tries = 12,
-                                double seed_spread = 0.6,
-                                double ik_timeout = 0.05)
+// setFromIK() checks kinematics and joint limits but NOT collisions. Handing
+// OMPL a single joint goal that happens to be in collision produces:
+//     "Unable to sample any valid states for goal tree"
+// because no valid state satisfies the goal. This wrapper gives setFromIK a
+// validity callback so it only ever returns collision-free solutions.
+// ---------------------------------------------------------------------------
+class IkValidator
 {
-    auto current_ptr = mg.getCurrentState(2.0);
-    if (!current_ptr)
+public:
+    explicit IkValidator(const rclcpp::Node::SharedPtr & node,
+                         const std::string & robot_description = "robot_description")
     {
-        std::cout << "    [-] Could not read current robot state.\n";
-        return false;
+        psm_ = std::make_shared<planning_scene_monitor::PlanningSceneMonitor>(node, robot_description);
+        psm_->startSceneMonitor("/monitored_planning_scene");
+        psm_->startWorldGeometryMonitor();
+        psm_->startStateMonitor();
+        if (!psm_->requestPlanningSceneState("/get_planning_scene"))
+            std::cout << "    [!] Could not fetch the initial planning scene; "
+                         "IK collision checks may be unreliable at startup.\n";
     }
 
-    moveit::core::RobotState current(*current_ptr);
-    const auto * jmg = current.getJointModelGroup(mg.getName());
+    moveit::core::GroupStateValidityCallbackFn callback()
+    {
+        auto psm = psm_;
+        return [psm](moveit::core::RobotState * state,
+                     const moveit::core::JointModelGroup * group,
+                     const double * values) -> bool
+        {
+            state->setJointGroupPositions(group, values);
+            state->update();
+            planning_scene_monitor::LockedPlanningSceneRO scene(psm);
+            if (!scene) return true;             // no scene yet: do not block IK
+            return !scene->isStateColliding(*state, group->getName());
+        };
+    }
+
+    bool isStateValid(const moveit::core::RobotState & state, const std::string & group)
+    {
+        planning_scene_monitor::LockedPlanningSceneRO scene(psm_);
+        if (!scene) return true;
+        return !scene->isStateColliding(state, group);
+    }
+
+private:
+    planning_scene_monitor::PlanningSceneMonitorPtr psm_;
+};
+
+// ---------------------------------------------------------------------------
+// Find a collision-free IK solution close to a seed configuration.
+//
+// On a 7-DOF arm a pose goal is a goal *region* -- OMPL samples IK solutions
+// from it, so consecutive plans can land in wildly different arm postures and
+// the arm appears to loop around itself. Pinning one nearby solution fixes
+// that, provided the solution is collision-free (hence the validator).
+// ---------------------------------------------------------------------------
+static bool solveNearestIk(MGI & mg,
+                           IkValidator & validator,
+                           const geometry_msgs::msg::Pose & pose,
+                           const moveit::core::RobotState & seed_state,
+                           moveit::core::RobotState & out_state,
+                           int tries = 15,
+                           double seed_spread = 0.8,
+                           double ik_timeout = 0.05)
+{
+    const auto * jmg = seed_state.getJointModelGroup(mg.getName());
     if (!jmg) return false;
 
-    std::vector<double> q_cur;
-    current.copyJointGroupPositions(jmg, q_cur);
+    const std::string tip = mg.getEndEffectorLink();
+    auto validity = validator.callback();
 
-    std::vector<double> q_best;
+    std::vector<double> q_seed;
+    seed_state.copyJointGroupPositions(jmg, q_seed);
+
     double best_cost = std::numeric_limits<double>::max();
+    bool found = false;
 
     for (int i = 0; i < tries; ++i)
     {
-        moveit::core::RobotState s(current);
+        moveit::core::RobotState s(seed_state);
+        if (i > 0) s.setToRandomPositionsNearBy(jmg, seed_state, seed_spread);
 
-        // Attempt 0 seeds from the exact current state (most likely to give a
-        // natural nearby solution); later attempts perturb the seed so we do
-        // not get stuck in one local branch.
-        if (i > 0) s.setToRandomPositionsNearBy(jmg, current, seed_spread);
-
-        if (!s.setFromIK(jmg, pose, mg.getEndEffectorLink(), ik_timeout))
-            continue;
+        if (!s.setFromIK(jmg, pose, tip, ik_timeout, validity)) continue;
+        if (!s.satisfiesBounds(jmg)) continue;
 
         std::vector<double> q;
         s.copyJointGroupPositions(jmg, q);
@@ -348,21 +418,37 @@ static bool setNearestJointGoal(MGI & mg,
         for (size_t k = 0; k < q.size(); ++k)
         {
             const double w = 1.0 + 0.5 * static_cast<double>(q.size() - k);
-            cost += w * std::fabs(q[k] - q_cur[k]);
+            cost += w * std::fabs(q[k] - q_seed[k]);
         }
 
-        if (cost < best_cost) { best_cost = cost; q_best = q; }
+        if (cost < best_cost) { best_cost = cost; out_state = s; found = true; }
     }
 
-    if (q_best.empty()) return false;
+    return found;
+}
 
-    mg.setJointValueTarget(q_best);
+static bool setNearestJointGoal(MGI & mg,
+                                IkValidator & validator,
+                                const geometry_msgs::msg::Pose & pose)
+{
+    auto current = mg.getCurrentState(2.0);
+    if (!current) return false;
+
+    moveit::core::RobotState goal(*current);
+    if (!solveNearestIk(mg, validator, pose, *current, goal)) return false;
+
+    mg.setJointValueTarget(goal);
     return true;
 }
 
-// Time-parameterise a raw trajectory (Cartesian paths come back untimed) and
-// execute it.
-static bool retimeAndExecute(MGI & mg,
+// ---------------------------------------------------------------------------
+// Time-parameterise a raw trajectory and execute it. Cartesian paths come back
+// with no velocities or timing, so this step is mandatory for them.
+//
+// Kept because it is useful if you ever want to execute a hand-built
+// trajectory. [[maybe_unused]] silences the warning while nothing calls it.
+// ---------------------------------------------------------------------------
+[[maybe_unused]] static bool retimeAndExecute(MGI & mg,
                              moveit_msgs::msg::RobotTrajectory & traj_msg,
                              double vel_scale,
                              double acc_scale)
@@ -384,47 +470,336 @@ static bool retimeAndExecute(MGI & mg,
     return mg.execute(traj_msg) == moveit::core::MoveItErrorCode::SUCCESS;
 }
 
-// Straight-line Cartesian move. Refuses to execute a partial path.
-static bool moveLinear(MGI & mg,
-                       const geometry_msgs::msg::Pose & target,
-                       double vel_scale,
-                       double acc_scale,
-                       double eef_step = 0.005,
-                       double min_fraction = 0.98)
+// ============================================================================
+//  THE INTERPOLATOR
+// ============================================================================
+
+struct CartesianOptions
 {
-    mg.setStartStateToCurrentState();
-    mg.clearPoseTargets();
+    double step               = 0.005;   // nominal spacing between waypoints, m
+    double max_joint_step     = 0.30;    // rad; reject a waypoint that jumps more
+    int    seeds_per_waypoint = 5;       // perturbed-seed retries per waypoint
+    int    max_subdivisions   = 4;       // how many times to halve a failing step
+    double ik_timeout         = 0.02;
 
-    std::vector<geometry_msgs::msg::Pose> waypoints{ target };
-    moveit_msgs::msg::RobotTrajectory traj_msg;
+    // ---- Free-axis relaxation ---------------------------------------------
+    // A test tube is a cylinder: rotating the gripper about the tube's long
+    // axis does not change the grasp. MoveIt's version demands a fully
+    // specified 6-DOF pose at every waypoint and throws that freedom away.
+    // Letting each waypoint pick its own rotation about free_axis turns a
+    // 6-DOF-constrained problem into a 5-DOF one, which massively enlarges
+    // the set of reachable paths.
+    //
+    // Set to 0.0 when the exact orientation genuinely matters.
+    double          free_axis_tolerance = 0.0;               // rad, e.g. M_PI
+    Eigen::Vector3d free_axis           = Eigen::Vector3d::UnitZ();  // in TCP frame
+    int             free_axis_samples   = 9;
+};
 
-#ifdef MOVEIT_JAZZY_OR_NEWER
-    const double fraction = mg.computeCartesianPath(
-        waypoints,
-        moveit::core::MaxEEFStep(eef_step),
-        moveit::core::JumpThreshold::relative(5.0),
-        traj_msg,
-        true /* avoid_collisions */);
-#else
-    // jump_threshold = 5.0 (relative). Do NOT pass 0.0 on a redundant arm --
-    // that disables the check and lets IK swap null-space branches mid-line,
-    // producing a violent flick.
-    const double fraction = mg.computeCartesianPath(
-        waypoints, eef_step, 5.0, traj_msg, true /* avoid_collisions */);
-#endif
+// Straight-line blend for position, slerp for orientation.
+static Eigen::Isometry3d lerpPose(const Eigen::Isometry3d & a,
+                                  const Eigen::Isometry3d & b,
+                                  double t)
+{
+    Eigen::Isometry3d out = Eigen::Isometry3d::Identity();
+    out.translation() = (1.0 - t) * a.translation() + t * b.translation();
+    const Eigen::Quaterniond qa(a.rotation());
+    const Eigen::Quaterniond qb(b.rotation());
+    out.linear() = qa.slerp(t, qb).toRotationMatrix();
+    return out;
+}
 
-    if (fraction < min_fraction)
+static Eigen::Isometry3d poseMsgToEigen(const geometry_msgs::msg::Pose & p)
+{
+    Eigen::Isometry3d out = Eigen::Isometry3d::Identity();
+    out.translation() = Eigen::Vector3d(p.position.x, p.position.y, p.position.z);
+    out.linear() = Eigen::Quaterniond(p.orientation.w, p.orientation.x,
+                                      p.orientation.y, p.orientation.z)
+                       .normalized().toRotationMatrix();
+    return out;
+}
+
+static double maxJointDelta(const moveit::core::RobotState & a,
+                            const moveit::core::RobotState & b,
+                            const moveit::core::JointModelGroup * jmg)
+{
+    std::vector<double> qa, qb;
+    a.copyJointGroupPositions(jmg, qa);
+    b.copyJointGroupPositions(jmg, qb);
+    double worst = 0.0;
+    for (size_t i = 0; i < qa.size(); ++i)
+        worst = std::max(worst, std::fabs(qa[i] - qb[i]));
+    return worst;
+}
+
+// ---------------------------------------------------------------------------
+// Solve a single waypoint. This is where all the retry logic lives -- the part
+// MoveIt's built-in version does not have.
+// ---------------------------------------------------------------------------
+static bool solveWaypoint(const moveit::core::JointModelGroup * jmg,
+                          const std::string & tip,
+                          IkValidator & validator,
+                          const Eigen::Isometry3d & goal_pose,
+                          const moveit::core::RobotState & prev,
+                          const CartesianOptions & opts,
+                          moveit::core::RobotState & out)
+{
+    auto validity = validator.callback();
+
+    auto attempt = [&](const Eigen::Isometry3d & pose,
+                       const moveit::core::RobotState & seed) -> bool
     {
-        std::cout << "    [-] Cartesian path only " << (fraction * 100.0)
-                  << "% complete. Not executing.\n";
+        moveit::core::RobotState s(seed);
+        if (!s.setFromIK(jmg, pose, tip, opts.ik_timeout, validity)) return false;
+        if (!s.satisfiesBounds(jmg)) return false;
+        // Local continuity check: reject a solution that jumped to a different
+        // part of the null space. This is the explicit version of MoveIt's
+        // "jump threshold", but measured against the previous waypoint rather
+        // than the average over the whole path.
+        if (maxJointDelta(prev, s, jmg) > opts.max_joint_step) return false;
+        out = s;
+        return true;
+    };
+
+    // 1. Exact pose, seeded from the previous solution.
+    if (attempt(goal_pose, prev)) return true;
+
+    // 2. Rotations about the free axis, walking outwards from zero so the
+    //    smallest deviation from the commanded orientation wins.
+    if (opts.free_axis_tolerance > 1e-6 && opts.free_axis_samples > 1)
+    {
+        const int half = std::max(1, opts.free_axis_samples / 2);
+        for (int k = 1; k <= half; ++k)
+        {
+            const double mag = opts.free_axis_tolerance *
+                               static_cast<double>(k) / static_cast<double>(half);
+            for (const double sign : { 1.0, -1.0 })
+            {
+                Eigen::Isometry3d r = Eigen::Isometry3d::Identity();
+                r.linear() = Eigen::AngleAxisd(sign * mag, opts.free_axis.normalized())
+                                 .toRotationMatrix();
+                if (attempt(goal_pose * r, prev)) return true;
+            }
+        }
+    }
+
+    // 3. Perturbed seeds, exact pose.
+    for (int i = 0; i < opts.seeds_per_waypoint; ++i)
+    {
+        moveit::core::RobotState seed(prev);
+        seed.setToRandomPositionsNearBy(jmg, prev, 0.25);
+        if (attempt(goal_pose, seed)) return true;
+    }
+
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// The interpolator itself. Returns the fraction of the line achieved and fills
+// `out` with whatever it managed to build.
+// ---------------------------------------------------------------------------
+static double planRobustCartesian(MGI & mg,
+                                  IkValidator & validator,
+                                  const geometry_msgs::msg::Pose & target,
+                                  const CartesianOptions & opts,
+                                  robot_trajectory::RobotTrajectory & out)
+{
+    auto current = mg.getCurrentState(2.0);
+    if (!current) return 0.0;
+
+    const auto * jmg = current->getJointModelGroup(mg.getName());
+    if (!jmg) return 0.0;
+    const std::string tip = mg.getEndEffectorLink();
+
+    const Eigen::Isometry3d start_pose = current->getGlobalLinkTransform(tip);
+    const Eigen::Isometry3d end_pose   = poseMsgToEigen(target);
+
+    const double distance = (end_pose.translation() - start_pose.translation()).norm();
+    if (distance < 1e-6) return 1.0;
+
+    const double dt_nominal = std::min(1.0, opts.step / distance);
+
+    out.clear();
+    out.addSuffixWayPoint(*current, 0.0);
+
+    moveit::core::RobotState prev(*current);
+    double t_done = 0.0;
+    int refinements = 0;
+    int guard = 0;
+
+    while (t_done < 1.0 - 1e-9 && guard++ < 4000)
+    {
+        double dt = dt_nominal;
+        bool advanced = false;
+
+        for (int sub = 0; sub <= opts.max_subdivisions; ++sub)
+        {
+            const double t_next = std::min(1.0, t_done + dt);
+            const Eigen::Isometry3d goal_i = lerpPose(start_pose, end_pose, t_next);
+
+            moveit::core::RobotState s(prev);
+            if (solveWaypoint(jmg, tip, validator, goal_i, prev, opts, s))
+            {
+                out.addSuffixWayPoint(s, 0.0);
+                prev = s;
+                t_done = t_next;
+                advanced = true;
+                if (sub > 0) ++refinements;
+                break;
+            }
+
+            dt *= 0.5;   // adaptive refinement: try a smaller move
+        }
+
+        if (!advanced) break;   // genuinely stuck
+    }
+
+    if (refinements > 0)
+        std::cout << "    [cart] refined the step " << refinements
+                  << " time(s) to get through tight spots.\n";
+
+    return t_done;
+}
+
+// ---------------------------------------------------------------------------
+// Pure joint-space interpolation between the current state and a target joint
+// configuration. Calls IK exactly ONCE (at the endpoint) instead of once per
+// waypoint, so it either works or fails cleanly -- never a mysterious 90%.
+//
+// The cost is that the tip bows slightly off the true straight line, so the
+// deviation is measured and the move is refused if it exceeds max_deviation.
+// Over a 10 cm approach expect 1-3 mm.
+// ---------------------------------------------------------------------------
+static bool moveJointInterpolated(MGI & mg,
+                                  IkValidator & validator,
+                                  const moveit::core::RobotState & goal_state,
+                                  double vel_scale,
+                                  double acc_scale,
+                                  int steps = 30,
+                                  double max_deviation = 0.006)
+{
+    auto current = mg.getCurrentState(2.0);
+    if (!current) return false;
+
+    const auto * jmg = current->getJointModelGroup(mg.getName());
+    const std::string tip = mg.getEndEffectorLink();
+
+    const Eigen::Vector3d p_start = current->getGlobalLinkTransform(tip).translation();
+    const Eigen::Vector3d p_end   = goal_state.getGlobalLinkTransform(tip).translation();
+    const Eigen::Vector3d line    = p_end - p_start;
+    const double line_len = line.norm();
+
+    robot_trajectory::RobotTrajectory rt(mg.getRobotModel(), mg.getName());
+    double worst_dev = 0.0;
+
+    for (int i = 0; i <= steps; ++i)
+    {
+        const double t = static_cast<double>(i) / static_cast<double>(steps);
+        moveit::core::RobotState s(*current);
+        current->interpolate(goal_state, t, s, jmg);
+        s.update();
+
+        if (!validator.isStateValid(s, mg.getName()))
+        {
+            std::cout << "    [-] Joint interpolation hits a collision at t=" << t << ".\n";
+            return false;
+        }
+
+        if (line_len > 1e-6)
+        {
+            const Eigen::Vector3d p = s.getGlobalLinkTransform(tip).translation();
+            const Eigen::Vector3d v = p - p_start;
+            const double proj = v.dot(line) / line_len;
+            const double dev = (v - (proj / line_len) * line).norm();
+            worst_dev = std::max(worst_dev, dev);
+        }
+
+        rt.addSuffixWayPoint(s, 0.0);
+    }
+
+    std::cout << "    [joint] max deviation from the straight line = "
+              << (worst_dev * 1000.0) << " mm\n";
+
+    if (worst_dev > max_deviation)
+    {
+        std::cout << "    [-] Deviation exceeds " << (max_deviation * 1000.0)
+                  << " mm; refusing.\n";
         return false;
     }
 
-    return retimeAndExecute(mg, traj_msg, vel_scale, acc_scale);
+    trajectory_processing::TimeOptimalTrajectoryGeneration totg;
+    if (!totg.computeTimeStamps(rt, vel_scale, acc_scale)) return false;
+
+    moveit_msgs::msg::RobotTrajectory msg;
+    rt.getRobotTrajectoryMsg(msg);
+    return mg.execute(msg) == moveit::core::MoveItErrorCode::SUCCESS;
 }
 
-// Free-space move with obstacle avoidance, via a seeded joint goal.
+// ---------------------------------------------------------------------------
+// Straight-line move with a three-rung fallback ladder:
+//   1. interpolator, exact orientation
+//   2. interpolator, allowing rotation about the tool axis
+//   3. joint interpolation between IK-verified endpoints
+// ---------------------------------------------------------------------------
+static bool moveLinear(MGI & mg,
+                       IkValidator & validator,
+                       const geometry_msgs::msg::Pose & target,
+                       double vel_scale,
+                       double acc_scale,
+                       double free_axis_tolerance = 0.0,
+                       double min_fraction = 0.995)
+{
+    CartesianOptions opts;
+    opts.free_axis_tolerance = 0.0;
+
+    robot_trajectory::RobotTrajectory traj(mg.getRobotModel(), mg.getName());
+
+    double fraction = planRobustCartesian(mg, validator, target, opts, traj);
+    std::cout << "    [cart] strict: " << (fraction * 100.0) << "%\n";
+
+    if (fraction < min_fraction && free_axis_tolerance > 1e-6)
+    {
+        opts.free_axis_tolerance = free_axis_tolerance;
+        robot_trajectory::RobotTrajectory relaxed(mg.getRobotModel(), mg.getName());
+        const double f2 = planRobustCartesian(mg, validator, target, opts, relaxed);
+        std::cout << "    [cart] free-axis relaxed: " << (f2 * 100.0) << "%\n";
+        if (f2 > fraction) { fraction = f2; traj = relaxed; }
+    }
+
+    if (fraction >= min_fraction)
+    {
+        trajectory_processing::TimeOptimalTrajectoryGeneration totg;
+        if (!totg.computeTimeStamps(traj, vel_scale, acc_scale))
+        {
+            std::cout << "    [-] Time parameterisation failed.\n";
+            return false;
+        }
+        moveit_msgs::msg::RobotTrajectory msg;
+        traj.getRobotTrajectoryMsg(msg);
+        return mg.execute(msg) == moveit::core::MoveItErrorCode::SUCCESS;
+    }
+
+    std::cout << "    [*] Straight-line planning stalled; trying joint interpolation.\n";
+
+    auto current = mg.getCurrentState(2.0);
+    if (!current) return false;
+
+    moveit::core::RobotState goal(*current);
+    if (!solveNearestIk(mg, validator, target, *current, goal))
+    {
+        std::cout << "    [-] No collision-free IK at the target at all. The pose is\n"
+                     "        unreachable, not merely hard to reach in a straight line.\n";
+        return false;
+    }
+
+    return moveJointInterpolated(mg, validator, goal, vel_scale, acc_scale);
+}
+
+// ---------------------------------------------------------------------------
+// Free-space move with obstacle avoidance, via a validated joint goal.
+// ---------------------------------------------------------------------------
 static bool moveFreeSpace(MGI & mg,
+                          IkValidator & validator,
                           const geometry_msgs::msg::Pose & target,
                           double vel_scale,
                           double acc_scale)
@@ -434,10 +809,9 @@ static bool moveFreeSpace(MGI & mg,
     mg.setMaxVelocityScalingFactor(vel_scale);
     mg.setMaxAccelerationScalingFactor(acc_scale);
 
-    if (!setNearestJointGoal(mg, target))
+    if (!setNearestJointGoal(mg, validator, target))
     {
-        std::cout << "    [!] Seeded IK failed; falling back to a pose goal "
-                     "(path may be less direct).\n";
+        std::cout << "    [!] No collision-free IK; falling back to a pose goal.\n";
         mg.setPoseTarget(target);
     }
 
@@ -445,33 +819,89 @@ static bool moveFreeSpace(MGI & mg,
     if (mg.plan(plan) != moveit::core::MoveItErrorCode::SUCCESS)
         return false;
 
-    // No manual retiming needed here: the OMPL pipeline already applies
-    // time-optimal parameterisation with the scaling factors set above.
+    // The OMPL pipeline already applies time-optimal parameterisation with the
+    // scaling factors set above, so no manual retiming is needed here.
     return mg.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS;
 }
 
-// Free-space transit to a standoff pose, then a pure vertical Cartesian descent.
+// ---------------------------------------------------------------------------
+// Backward-planned approach:
+//   1. find a collision-free IK solution at the GRASP pose
+//   2. seed the standoff IK from it, so both ends share an IK branch and the
+//      arm cannot arrive at a standoff posture that runs out of joint range
+//      part-way down
+//   3. free-space transit to that standoff configuration
+//   4. straight-line descent with the fallback ladder
+// ---------------------------------------------------------------------------
 static bool approachTarget(MGI & mg,
+                           IkValidator & validator,
                            const geometry_msgs::msg::Pose & target,
                            double standoff_z,
                            double vel_scale,
-                           double acc_scale)
+                           double acc_scale,
+                           double free_axis_tolerance = 0.0)
 {
     geometry_msgs::msg::Pose standoff = target;
     standoff.position.z += standoff_z;
 
-    std::cout << "    [1/2] Transit to standoff (z+" << standoff_z << ")...\n";
-    if (!moveFreeSpace(mg, standoff, vel_scale, acc_scale))
+    auto current = mg.getCurrentState(2.0);
+    if (!current)
     {
-        std::cout << "    [-] Transit failed.\n";
+        std::cout << "    [-] Could not read robot state.\n";
+        return false;
+    }
+
+    // ---- Step 1: is the FINAL pose reachable and collision-free? -----------
+    // Failing here is much more useful than failing 90% of the way down.
+    moveit::core::RobotState grasp_state(*current);
+    if (!solveNearestIk(mg, validator, target, *current, grasp_state))
+    {
+        std::cout << "    [-] No collision-free IK at the target pose. "
+                     "Aborting before moving anywhere.\n";
+        return false;
+    }
+
+    // ---- Step 2: seed the standoff from the grasp solution ------------------
+    moveit::core::RobotState standoff_state(grasp_state);
+    if (!solveNearestIk(mg, validator, standoff, grasp_state, standoff_state, 8, 0.3))
+    {
+        std::cout << "    [!] Could not seed the standoff from the grasp solution; "
+                     "retrying from the current state.\n";
+        if (!solveNearestIk(mg, validator, standoff, *current, standoff_state))
+        {
+            std::cout << "    [-] No collision-free IK at the standoff pose.\n";
+            return false;
+        }
+    }
+
+    // ---- Step 3: transit ----------------------------------------------------
+    mg.setStartStateToCurrentState();
+    mg.clearPoseTargets();
+    mg.setJointValueTarget(standoff_state);
+    mg.setMaxVelocityScalingFactor(vel_scale);
+    mg.setMaxAccelerationScalingFactor(acc_scale);
+
+    std::cout << "    [1/2] Transit to standoff (z+" << standoff_z << ")...\n";
+    MGI::Plan plan;
+    if (mg.plan(plan) != moveit::core::MoveItErrorCode::SUCCESS)
+    {
+        std::cout << "    [-] Transit planning failed even with a validated goal. "
+                     "The start state may itself be in collision -- check RViz.\n";
+        return false;
+    }
+    if (mg.execute(plan) != moveit::core::MoveItErrorCode::SUCCESS)
+    {
+        std::cout << "    [-] Transit execution failed.\n";
         return false;
     }
     waitForStateSettle(mg, 200);
 
-    std::cout << "    [2/2] Cartesian descent...\n";
-    if (!moveLinear(mg, target, vel_scale * 0.5, acc_scale * 0.5))
+    // ---- Step 4: descend ----------------------------------------------------
+    std::cout << "    [2/2] Descent...\n";
+    if (!moveLinear(mg, validator, target, vel_scale * 0.5, acc_scale * 0.5,
+                    free_axis_tolerance))
     {
-        std::cout << "    [-] Descent blocked. Holding at standoff.\n";
+        std::cout << "    [-] Descent incomplete. Holding at standoff.\n";
         return false;
     }
     return true;
@@ -720,6 +1150,9 @@ int main(int argc, char * argv[])
     MGI arm_interface(node, "arm_group");
     MGI gripper_interface(node, "gripper");
 
+    // Collision-aware IK. Must exist before any motion helper is called.
+    IkValidator ik_validator(node);
+
     const std::string planning_frame = arm_interface.getPlanningFrame();
     const std::string tcp_link       = arm_interface.getEndEffectorLink();
 
@@ -758,7 +1191,7 @@ int main(int argc, char * argv[])
     home_pose.orientation.w = q_upright.w();
 
     std::cout << ">>> [INIT] Moving to home pose...\n";
-    if (!moveFreeSpace(arm_interface, home_pose, VEL_SCALE_TRANSIT, ACC_SCALE_TRANSIT))
+    if (!moveFreeSpace(arm_interface, ik_validator, home_pose, VEL_SCALE_TRANSIT, ACC_SCALE_TRANSIT))
     {
         std::cout << "[-] [INIT] Failed to reach the home pose. Aborting.\n";
         rclcpp::shutdown();
@@ -892,7 +1325,7 @@ int main(int argc, char * argv[])
         {
             const double v = attached_tube.empty() ? VEL_SCALE_TRANSIT : VEL_SCALE_LIQUID;
             const double a = attached_tube.empty() ? ACC_SCALE_TRANSIT : ACC_SCALE_LIQUID;
-            if (moveFreeSpace(arm_interface, home_pose, v, a))
+            if (moveFreeSpace(arm_interface, ik_validator, home_pose, v, a))
                 std::cout << ">>> Home.\n";
             else
                 std::cout << "    [-] Could not reach home.\n";
@@ -1138,11 +1571,12 @@ int main(int argc, char * argv[])
             arm_interface.setPathConstraints(c);
         }
 
-        if (!approachTarget(arm_interface, target, standoff, v, a))
+        if (!approachTarget(arm_interface, ik_validator, target, standoff, v, a,
+                           TOOL_AXIS_FREEDOM))
         {
             arm_interface.clearPathConstraints();
             std::cout << "    [!] RECOVERY: returning home...\n";
-            if (!moveFreeSpace(arm_interface, home_pose, VEL_SCALE_TRANSIT, ACC_SCALE_TRANSIT))
+            if (!moveFreeSpace(arm_interface, ik_validator, home_pose, VEL_SCALE_TRANSIT, ACC_SCALE_TRANSIT))
                 std::cout << "    [!] CRITICAL: could not reach home. Arm may be trapped.\n";
         }
         else
