@@ -122,8 +122,9 @@ static constexpr double STANDOFF_TUBE  = 0.10;
 // strict straight line fails. A test tube is a cylinder, so spin about its long
 // axis does not change the grasp -- that freedom is yours to spend.
 // Set to 0.0 if your gripper fingers are asymmetric or a cable would wrap.
-// IMPORTANT: CartesianOptions::free_axis defaults to the TCP frame's Z. Verify
-// that Z is the axis running along the tube on your robot before enabling this.
+// AXIS: the tube axis is the TCP frame's X, because q_upright = setRPY(0, -pi/2,
+// pi/2) maps TCP local X onto world +Z. If you ever change q_upright, recompute
+// this -- freeing the wrong axis lets the arm invert the tube.
 static constexpr double TOOL_AXIS_FREEDOM = M_PI;
 
 // How far the tube may tip from vertical during a carrying move, in radians.
@@ -133,6 +134,15 @@ static constexpr double TILT_TOLERANCE = 0.3;
 static constexpr double STANDOFF_MIXER = 0.12;
 
 // ---- Misc ------------------------------------------------------------------
+// ---- Derived: where the carried tube sits relative to the TCP -------------
+// Fixed at the moment of grasp, so it follows straight from the grasp geometry.
+static constexpr double TUBE_TCP_Y_OFFSET = TUBE_Y_OFFSET - GRASP_Y_OFFSET;   // -0.135
+static constexpr double TUBE_TCP_Z_OFFSET = TUBE_CENTER_Z - GRASP_Z;          // -0.030
+
+// ---- Derived: where the TCP must be to hold the tube over the mixer -------
+static constexpr double MIXER_TOP_Z    = MIXER_CENTER_Z + MIXER_HEIGHT / 2.0;  // 0.165
+static constexpr double MIXER_CLEARANCE = 0.03;   // tube bottom above mixer rim
+
 static constexpr int NUM_TUBES       = 5;
 static constexpr int MIXER_MARKER    = 6;
 static constexpr int STATE_SETTLE_MS = 500;
@@ -298,7 +308,7 @@ static void setupCollisionObjects(const std::string & frame_id, tf2_ros::Buffer 
     }
 
     // ---- Mixer -------------------------------------------------------------
-    double mixer_x = -0.32, mixer_y = -0.33;   // fallback
+    double mixer_x = -0.32, mixer_y = -0.23;   // fallback
     if (!lookupMarkerXY(tf_buffer, frame_id, MIXER_MARKER, mixer_x, mixer_y))
         std::cout << "    [-] TF for marker_6 not ready. Using fallback mixer pose.\n";
     objects.push_back(makeMixer(frame_id, mixer_x, mixer_y));
@@ -311,6 +321,32 @@ static void waitForStateSettle(MGI & iface, int ms = STATE_SETTLE_MS)
 {
     rclcpp::sleep_for(std::chrono::milliseconds(ms));
     iface.startStateMonitor(1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Where the TCP must be for the CARRIED TUBE to hang over the mixer.
+//
+// The old target sent the TCP to the mixer marker itself. But the tube hangs
+// 135 mm behind the TCP in y and 30 mm below it in z, so the tube ended up
+// 235 mm from the mixer body -- the pour missed completely. Worse, at the old
+// POUR_Z the tube's bottom sat at z=0.105 while the mixer rim is at z=0.165,
+// so once aligned it would have been inside the mixer's collision cylinder.
+//
+// This works backwards from where the TUBE has to be instead.
+// ---------------------------------------------------------------------------
+static void mixerPourPose(double marker_x, double marker_y,
+                          double & tcp_x, double & tcp_y, double & tcp_z)
+{
+    tcp_x = marker_x;
+    tcp_y = marker_y + MIXER_Y_OFFSET - TUBE_TCP_Y_OFFSET;
+    tcp_z = std::max(POUR_Z,
+                     MIXER_TOP_Z + MIXER_CLEARANCE + TUBE_HEIGHT / 2.0 - TUBE_TCP_Z_OFFSET);
+
+    std::cout << "    [mixer] body at (" << tcp_x << ", " << (marker_y + MIXER_Y_OFFSET)
+              << "), rim z=" << MIXER_TOP_Z << "\n"
+              << "    [mixer] TCP -> (" << tcp_x << ", " << tcp_y << ", " << tcp_z
+              << ") so the tube bottom clears the rim by "
+              << (MIXER_CLEARANCE * 1000.0) << " mm\n";
 }
 
 // ============================================================================
@@ -497,7 +533,10 @@ struct CartesianOptions
     //
     // Set to 0.0 when the exact orientation genuinely matters.
     double          free_axis_tolerance = 0.0;               // rad, e.g. M_PI
-    Eigen::Vector3d free_axis           = Eigen::Vector3d::UnitZ();  // in TCP frame
+    // TCP local X, NOT Z. Under q_upright = setRPY(0, -pi/2, pi/2) the TCP's X
+    // axis points straight up, so X is the tube's long axis and the harmless
+    // one to spin about. Z points horizontally -- freeing it tips the tube.
+    Eigen::Vector3d free_axis           = Eigen::Vector3d::UnitX();  // in TCP frame
     int             free_axis_samples   = 9;
 };
 
@@ -839,9 +878,9 @@ static moveit_msgs::msg::Constraints uprightConstraint(
     ocm.link_name                 = tcp_link;
     ocm.header.frame_id           = planning_frame;
     ocm.orientation               = upright;
-    ocm.absolute_x_axis_tolerance = tilt_tolerance;   // tipping -- keep tight
+    ocm.absolute_x_axis_tolerance = M_PI;             // roll about the tube -- free
     ocm.absolute_y_axis_tolerance = tilt_tolerance;   // tipping -- keep tight
-    ocm.absolute_z_axis_tolerance = M_PI;             // roll about the tube -- free
+    ocm.absolute_z_axis_tolerance = tilt_tolerance;   // tipping -- keep tight
     ocm.weight                    = 1.0;
 
     // ROTATION_VECTOR handles "one axis completely free" far better than the
@@ -858,7 +897,7 @@ static moveit_msgs::msg::Constraints uprightConstraint(
 // ---------------------------------------------------------------------------
 // Orientation path constraint for carrying a tube.
 //
-// AXIS CONVENTION: the free axis here is Z, matching CartesianOptions::free_axis.
+// AXIS CONVENTION: the free axis is X, matching CartesianOptions::free_axis.
 // Rotation about the tube's long axis does not spill anything, so it is left
 // free; tipping (X and Y) is what must stay tight. The previous version had X
 // free and Y/Z at 0.25 rad, which is the opposite convention and would have
@@ -896,7 +935,7 @@ static const moveit_msgs::msg::RobotTrajectory & planTraj(const MGI::Plan & p)
 static double maxTiltAlongTrajectory(MGI & mg,
                                      const moveit_msgs::msg::RobotTrajectory & traj_msg,
                                      const geometry_msgs::msg::Quaternion & reference,
-                                     const Eigen::Vector3d & tool_axis = Eigen::Vector3d::UnitZ())
+                                     const Eigen::Vector3d & tool_axis = Eigen::Vector3d::UnitX())
 {
     auto current = mg.getCurrentState(2.0);
     if (!current) return 0.0;
@@ -1051,9 +1090,6 @@ static bool approachTarget(MGI & mg,
                            const std::string & tcp_link = "",
                            const std::string & planning_frame = "")
 {
-    geometry_msgs::msg::Pose standoff = target;
-    standoff.position.z += standoff_z;
-
     auto current = mg.getCurrentState(2.0);
     if (!current)
     {
@@ -1061,28 +1097,71 @@ static bool approachTarget(MGI & mg,
         return false;
     }
 
+    std::cout << "    [target] (" << target.position.x << ", " << target.position.y
+              << ", " << target.position.z << ")\n";
+
     // ---- Step 1: is the FINAL pose reachable and collision-free? -----------
     // Failing here is much more useful than failing 90% of the way down.
     moveit::core::RobotState grasp_state(*current);
     if (!solveNearestIk(mg, validator, target, *current, grasp_state))
     {
-        std::cout << "    [-] No collision-free IK at the target pose. "
-                     "Aborting before moving anywhere.\n";
+        std::cout << "    [-] No collision-free IK at the TARGET pose itself.\n"
+                     "        Either it is out of reach, or something is in the way.\n"
+                     "        Drag the interactive marker there in RViz to see which.\n";
         return false;
     }
 
-    // ---- Step 2: seed the standoff from the grasp solution ------------------
+    // ---- Step 2: find a standoff height that also has IK --------------------
+    // A fixed standoff is brittle. The mixer sits at a high pour height, and
+    // adding a full 12 cm on top of that can push the standoff clean out of the
+    // arm's reach even though the target itself is fine. Walk the height down
+    // until something works, and drop to zero (straight to the target, no
+    // descent) rather than failing outright.
+    geometry_msgs::msg::Pose standoff = target;
     moveit::core::RobotState standoff_state(grasp_state);
-    if (!solveNearestIk(mg, validator, standoff, grasp_state, standoff_state, 8, 0.3))
+    double used_standoff = -1.0;
+
+    for (const double scale : { 1.0, 0.7, 0.45, 0.25, 0.0 })
     {
-        std::cout << "    [!] Could not seed the standoff from the grasp solution; "
-                     "retrying from the current state.\n";
-        if (!solveNearestIk(mg, validator, standoff, *current, standoff_state))
+        const double sz = standoff_z * scale;
+        if (sz < 0.005)
         {
-            std::cout << "    [-] No collision-free IK at the standoff pose.\n";
-            return false;
+            used_standoff = 0.0;   // no standoff: go straight to the target
+            break;
         }
+
+        geometry_msgs::msg::Pose cand = target;
+        cand.position.z += sz;
+
+        if (solveNearestIk(mg, validator, cand, grasp_state, standoff_state, 8, 0.3) ||
+            solveNearestIk(mg, validator, cand, *current, standoff_state, 12, 0.8))
+        {
+            standoff = cand;
+            used_standoff = sz;
+            break;
+        }
+        std::cout << "    [!] No IK at standoff z+" << sz << "; trying lower.\n";
     }
+
+    if (used_standoff < 0.0)
+    {
+        std::cout << "    [-] No collision-free IK at any standoff height.\n";
+        return false;
+    }
+
+    if (used_standoff < 0.005)
+    {
+        // Straight to the target -- there is no room above it for a descent.
+        std::cout << "    [1/1] No standoff possible; moving directly to the target.\n";
+        const bool ok = carrying
+            ? moveFreeSpaceUpright(mg, validator, target, vel_scale, acc_scale,
+                                   tcp_link, planning_frame)
+            : moveFreeSpace(mg, validator, target, vel_scale, acc_scale);
+        if (!ok) std::cout << "    [-] Direct move to the target failed.\n";
+        return ok;
+    }
+
+    standoff_z = used_standoff;
 
     // ---- Step 3: transit ----------------------------------------------------
     std::cout << "    [1/2] Transit to standoff (z+" << standoff_z << ")...\n";
@@ -1332,9 +1411,10 @@ static bool executeLiquidTransferTask(int target_marker,
     // Transit to the mixer, tube held upright.
     geometry_msgs::msg::PoseStamped pour_pose;
     pour_pose.header.frame_id  = planning_frame;
-    pour_pose.pose.position.x  = mixer_mx;
-    pour_pose.pose.position.y  = mixer_my;
-    pour_pose.pose.position.z  = POUR_Z;
+    mixerPourPose(mixer_mx, mixer_my,
+                  pour_pose.pose.position.x,
+                  pour_pose.pose.position.y,
+                  pour_pose.pose.position.z);
     pour_pose.pose.orientation = q_upright_msg;
     {
         auto s = std::make_unique<mtc::stages::MoveTo>("move to mixer", planner_ompl);
@@ -1783,8 +1863,7 @@ int main(int argc, char * argv[])
                     tx = mx;
                     if (marker_id == MIXER_MARKER)
                     {
-                        ty = my;
-                        tz = POUR_Z;
+                        mixerPourPose(mx, my, tx, ty, tz);
                         standoff = STANDOFF_MIXER;
                     }
                     else
@@ -1804,7 +1883,7 @@ int main(int argc, char * argv[])
                     }
                     else if (marker_id == MIXER_MARKER)
                     {
-                        tx = -0.20; ty = -0.11; tz = POUR_Z;
+                        mixerPourPose(-0.20, -0.11, tx, ty, tz);
                         standoff = STANDOFF_MIXER;
                     }
                     else
