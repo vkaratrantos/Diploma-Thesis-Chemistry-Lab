@@ -244,7 +244,7 @@ int main(int argc, char * argv[])
     }
 
     arm_interface.setGoalPositionTolerance(0.005);
-    arm_interface.setGoalOrientationTolerance(0.1);
+    arm_interface.setGoalOrientationTolerance(0.02);
 
     std::cout << "\n>>> Ready. Waiting for GUI commands on '/gui_commands'...\n";
 
