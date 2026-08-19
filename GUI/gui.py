@@ -8,6 +8,7 @@ import sys
 # --- ROS 2 LIBRARIES ---
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
 from std_msgs.msg import String
 
 # Configuration
@@ -55,7 +56,23 @@ class LabApp:
         rclpy.init(args=None)
         self.ros_node = rclpy.create_node('gui_commander_node')
         self.publisher = self.ros_node.create_publisher(String, '/gui_commands', 10)
-        
+
+        # Outcome of each command, so a sequence can stop when a step fails.
+        # simple_move publishes "OK <cmd>" or "FAIL <cmd>" on /gui_status.
+        self.status_lock = threading.Lock()
+        self.status_event = threading.Event()
+        self.pending_cmd = None
+        self.last_result = None
+        self.abort_requested = False
+        self.ros_node.create_subscription(String, '/gui_status', self.status_cb, 10)
+
+        # The node has to be spun to RECEIVE anything. Publishing worked without
+        # this, which is why it was never needed before.
+        self.executor = SingleThreadedExecutor()
+        self.executor.add_node(self.ros_node)
+        self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
+        self.spin_thread.start()
+
         # Ensure ROS 2 shuts down cleanly when you close the window
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -95,8 +112,22 @@ class LabApp:
     def on_close(self):
         """Safely shuts down the ROS 2 node when the GUI is closed."""
         self.log("Shutting down GUI Node...")
-        self.ros_node.destroy_node()
-        rclpy.shutdown()
+        # Release any sequence blocked in send_and_wait, or the daemon thread
+        # sits on its timeout while the window is already gone.
+        self.abort_requested = True
+        self.status_event.set()
+        try:
+            self.executor.shutdown()
+            # Let spin() actually return before tearing the node down, or rclpy
+            # aborts with "terminate called without an active exception".
+            self.spin_thread.join(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            self.ros_node.destroy_node()
+            rclpy.shutdown()
+        except Exception:
+            pass
         self.root.destroy()
 
     def log(self, message):
@@ -121,13 +152,65 @@ class LabApp:
         self.publisher.publish(msg)
         self.log(f"Command fired -> {cmd}")
 
-    def _send_sequence_for_marker(self, marker_id):
-        """Sends the sequence for a single tube. (No longer spins up rogue threads)"""
-        commands = ["o", f"m {marker_id}", "c", "m 6", "p", f"m {marker_id}", "o"]
-        for cmd in commands:
-            self.send_command(cmd)
-            # Give the C++ script a tiny moment to register each command
-            time.sleep(0.1) 
+    def status_cb(self, msg):
+        """Receives 'OK <cmd>' / 'FAIL <cmd>' from simple_move."""
+        data = msg.data.strip()
+        ok = data.startswith("OK ")
+        cmd = data.split(" ", 1)[1].strip() if " " in data else ""
+        with self.status_lock:
+            # Ignore anything we are not currently waiting on -- a late reply to
+            # an aborted step must not release the next wait.
+            if self.pending_cmd is None or cmd != self.pending_cmd:
+                return
+            self.last_result = ok
+            self.pending_cmd = None
+        self.status_event.set()
+
+    def send_and_wait(self, cmd, timeout):
+        """Sends one command and blocks until simple_move reports its outcome.
+
+        Returns False on failure OR timeout. This is what makes a sequence stop
+        instead of firing the next step into a robot that never arrived.
+        """
+        with self.status_lock:
+            self.pending_cmd = cmd
+            self.last_result = None
+        self.status_event.clear()
+
+        self.send_command(cmd)
+
+        if not self.status_event.wait(timeout):
+            with self.status_lock:
+                self.pending_cmd = None
+            self.log(f"    TIMEOUT after {timeout:.0f}s waiting for '{cmd}'")
+            return False
+        return bool(self.last_result)
+
+    def _run_tube(self, marker_id):
+        """One full dispense cycle for a tube, aborting at the first failure.
+
+        Uses the manual command path (m<N>/c/p/o) rather than 'TASK <N>'. The
+        MTC pipeline behind TASK does a hard TF lookup and fails outright
+        without the camera; this path falls back to the predefined tube
+        positions, and it is the path that actually gets exercised and fixed.
+        """
+        steps = [
+            (f"m{marker_id}", 180.0, f"move above tube {marker_id}"),
+            ("c",              90.0, "close gripper"),
+            ("m6",            180.0, "carry to mixer"),
+            ("p",              90.0, "pour"),
+            (f"m{marker_id}", 180.0, f"return tube {marker_id}"),
+            ("o",              90.0, "release"),
+        ]
+        for cmd, timeout, label in steps:
+            if self.abort_requested:
+                self.log("Sequence aborted by user.")
+                return False
+            self.log(f"  -> {label}  [{cmd}]")
+            if not self.send_and_wait(cmd, timeout):
+                self.log(f"  !! STEP FAILED: {label}  [{cmd}] -- stopping sequence")
+                return False
+        return True
 
     # --- AUTO MODE ---
     def build_auto_tab(self):
@@ -145,13 +228,22 @@ class LabApp:
     def run_recipe(self, recipe_name):
         markers = RECIPES[recipe_name]
         self.log(f"Auto-Sequence Started: {recipe_name}")
-        
-        # FIX: A single unified thread handles all markers perfectly in order
+
         def task():
-            with self.sequence_lock:
-                for marker in markers:
-                    self._send_sequence_for_marker(marker)
-                    
+            if not self.sequence_lock.acquire(blocking=False):
+                self.log("A sequence is already running; ignoring.")
+                return
+            try:
+                self.abort_requested = False
+                for i, marker in enumerate(markers, 1):
+                    self.log(f"[{i}/{len(markers)}] Tube {marker}")
+                    if not self._run_tube(marker):
+                        self.log(f"Auto-Sequence ABORTED at tube {marker}.")
+                        return
+                self.log(f"Auto-Sequence complete: {recipe_name}")
+            finally:
+                self.sequence_lock.release()
+
         threading.Thread(target=task, daemon=True).start()
 
     # --- MANUAL MODE ---
@@ -228,13 +320,21 @@ class LabApp:
         self.manual_batch.clear()
         self.batch_lbl.config(text="SEQUENCE: 0 ITEMS PENDING", fg=COLOR_TEXT_DIM)
 
-        # FIX: Unified thread logic prevents batch interleaving
         def task():
-            with self.sequence_lock:
-                for tube_string in batch_to_run:
+            if not self.sequence_lock.acquire(blocking=False):
+                self.log("A sequence is already running; ignoring.")
+                return
+            try:
+                self.abort_requested = False
+                for i, tube_string in enumerate(batch_to_run, 1):
                     marker_id = tube_string.split(" ")[1]
-                    self._send_sequence_for_marker(marker_id)
-            self.log("Manual Sequence Completed.")
+                    self.log(f"[{i}/{len(batch_to_run)}] {tube_string}")
+                    if not self._run_tube(marker_id):
+                        self.log(f"Manual Sequence ABORTED at {tube_string}.")
+                        return
+                self.log("Manual Sequence Completed.")
+            finally:
+                self.sequence_lock.release()
 
         threading.Thread(target=task, daemon=True).start()
 
