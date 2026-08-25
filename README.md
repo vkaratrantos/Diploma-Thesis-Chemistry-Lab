@@ -7,7 +7,7 @@ A robotic system that automates liquid-handling in a chemistry lab: it locates
 test tubes visually, picks them up, carries them to a mixing vessel and pours,
 keeping the tube upright throughout so nothing spills.
 
-The system does **not** work from taught positions. Tube and vessel locations
+The system does not work from taught positions. Tube and vessel locations
 come from ArUco markers detected at runtime, so the rack can be moved between
 runs and the arm adapts.
 
@@ -17,9 +17,9 @@ runs and the arm adapts.
 
 Three problems that a simple pick-and-place demo does not have:
 
-1. **The tube must stay upright.**
-2. **Positions are not known in advance.**
-3. **A 7-DOF arm is redundant.**
+1. The tube must stay upright.
+2. Positions are not known in advance.
+3. A 7-DOF arm is redundant.
 
 ---
 
