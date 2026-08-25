@@ -4,21 +4,16 @@ import glob
 import shutil
 from camera_utils import calibrate_camera, capture_calibration_images
 
-
-# -----------------------------------------------------------
-#  SAVE CALIBRATION DATA INTO camera_params.json
-# -----------------------------------------------------------
 def save_to_json(camera_number, intrinsic, distortion, json_file = "camera_params.json"):
 
     data = {}
 
-    # Load existing JSON if present
     if os.path.exists(json_file):
         with open(json_file, "r") as f:
             try:
                 data = json.load(f)
             except:
-                data = {}   # empty or corrupt
+                data = {} 
 
     # Overwrite or create this camera number
     data["camera_parameters"][str(camera_number)] = {
@@ -26,16 +21,13 @@ def save_to_json(camera_number, intrinsic, distortion, json_file = "camera_param
         "dist_coeffs": distortion.tolist()
     }
 
-    # Save back to file
     with open(json_file, "w") as f:
         json.dump(data, f, indent=4)
 
     print(f"Saved calibration for camera [{camera_number}] into {json_file}.")
 
 
-# -----------------------------------------------------------
 #  DELETE PREVIOUS CALIBRATION IMAGES
-# -----------------------------------------------------------
 def delete_calibration_images(folder):
     if not os.path.exists(folder):
         return
@@ -52,11 +44,7 @@ def delete_calibration_images(folder):
         print("All calibration images deleted.\n")
     else:
         print("Images kept.\n")
-
-
-# -----------------------------------------------------------
-#  MAIN PROGRAM
-# -----------------------------------------------------------
+        
 def main():
 
     calibration_folder = "calibration_images"
@@ -64,18 +52,13 @@ def main():
 
     print("\n========== CAMERA CALIBRATION ==========\n")
 
-    # -------------------------------------------------------
-    # DELETE IMAGES (OPTIONAL)
-    # -------------------------------------------------------
+    # DELETE IMAGES
     delete_answer = input("Delete previous calibration images? (y/n): ").lower().strip()
     if delete_answer == "y":
         delete_calibration_images(calibration_folder)
     else:
         print("Keeping existing calibration images.\n")
 
-    # -------------------------------------------------------
-    # ASK FOR CAMERA NUMBER TO STORE IN JSON
-    # -------------------------------------------------------
     while True:
         cam_number = input("Enter camera number to save calibration under: ").strip()
         if cam_number.isdigit():
@@ -83,16 +66,12 @@ def main():
             break
         print("Invalid input. Must be an integer.")
 
-    # -------------------------------------------------------
-    # CAPTURE NEW IMAGES (OPTIONAL)
-    # -------------------------------------------------------
+    # CAPTURE NEW IMAGES
     capture_answer = input("Capture new calibration images now? (y/n): ").lower().strip()
     if capture_answer == "y":
         capture_calibration_images(calibration_folder)
 
-    # -------------------------------------------------------
     # RUN CALIBRATION
-    # -------------------------------------------------------
     print("\nRunning calibration...\n")
 
     intrinsic, dist_coeffs, error = calibrate_camera(calibration_pattern)
@@ -106,9 +85,7 @@ def main():
     print("Distortion Coefficients:\n", dist_coeffs)
     print(f"Reprojection Error: {error:.5f}")
 
-    # -------------------------------------------------------
     # SAVE RESULTS TO JSON
-    # -------------------------------------------------------
     save_to_json(
         camera_number = cam_number,
         intrinsic = intrinsic,
