@@ -71,7 +71,7 @@ vertical, with the wrist recovered in closed form.
 | Path | What it is |
 | --- | --- |
 | [`aruco/aruco_anchor.py`](aruco) | Marker detection, TF publishing |
-| [`aruco/calibrate_camera.py/`](camera_calibration) | Intrinsics and camera-to-arm calibration |
+| [`aruco/calibrate_camera.py`](camera_calibration) | Intrinsics and camera-to-arm calibration |
 | [`robot_initialisation/`](MyArm%20300%20Pi) | Arm driver and hardware bridge |
 | [`robot_initialisation/`](robot_initialisation) | Startup and homing |
 | [`launch/`](launch) | Launch files — fake robot, Gazebo, real arm |
