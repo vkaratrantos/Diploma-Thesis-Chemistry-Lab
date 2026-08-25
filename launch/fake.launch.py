@@ -26,53 +26,43 @@ def load_yaml(package_name, file_path):
 def generate_launch_description():
     moveit_config_pkg = 'robot_config'
 
-    # =========================================================================
     # 1. Load Robot URDF
-    # =========================================================================
+    
     urdf_path = "/home/vkaratrantos/elephant_robots_ws/src/myarm_300_pi/urdf/myarm_300_pi_thorgripper.urdf"
     if not os.path.exists(urdf_path):
          urdf_path = os.path.join(get_package_share_directory("mycobot_description"), "urdf/myarm_300_pi/myarm_300_pi.urdf")
     robot_description_config = xacro.process_file(urdf_path)
     robot_description = {'robot_description': robot_description_config.toxml()}
 
-    # =========================================================================
     # 2. Load Core MoveIt Configs (SRDF, Kinematics, Limits)
-    # =========================================================================
+    
     robot_description_semantic_config = load_file(moveit_config_pkg, 'config/myarm_300_pi_thorgripper.srdf')
     robot_description_semantic = {'robot_description_semantic': robot_description_semantic_config}
     
     kinematics_yaml = load_yaml(moveit_config_pkg, 'config/kinematics.yaml')
     
-    # Φορτώνουμε τα joint limits που φτιάξαμε
     joint_limits_yaml = load_yaml(moveit_config_pkg, 'config/joint_limits.yaml')
     
-    # [ΝΕΟ] Ενώνουμε τα Joint Limits με τα Καρτεσιανά (Cartesian) Limits για τον Pilz
     robot_description_planning_config = {
         'robot_description_planning': {
-            **joint_limits_yaml,  # Βάζει μέσα τα joint limits
-            'cartesian_limits': { # Ορίζουμε τα όρια για τη γραμμική κίνηση στο χώρο
-                'max_trans_vel': 0.5,    # m/s (Μέγιστη ταχύτητα μετάφρασης)
-                'max_trans_acc': 1.0,    # m/s^2 (Επιτάχυνση)
-                'max_trans_dec': -1.0,   # m/s^2 (Επιβράδυνση)
-                'max_rot_vel': 1.5,      # rad/s (Μέγιστη ταχύτητα περιστροφής)
+            **joint_limits_yaml,
+            'cartesian_limits': { 
+                'max_trans_vel': 0.5,
+                'max_trans_acc': 1.0,
+                'max_trans_dec': -1.0,
+                'max_rot_vel': 1.5, 
                 'max_rot_acc': 2.0,
                 'max_rot_dec': -2.0,
             }
         }
     }
 
-    # =========================================================================
-    # 3. Load Planning Pipelines (OMPL, Pilz, & STOMP)
-    # =========================================================================
+    # Load Planning Pipelines (OMPL, Pilz, & STOMP)
+    
     ompl_planning_yaml = load_yaml(moveit_config_pkg, 'config/ompl_planning.yaml')
     
-    # [NEW] Φορτώνουμε το νέο Hybrid Pipeline (OMPL + STOMP)
     ompl_stomp_planning_yaml = load_yaml(moveit_config_pkg, 'config/ompl_stomp_planning.yaml')
-    
-    # [NEW] Φορτώνουμε τους κανόνες αξιολόγησης του STOMP
     stomp_config_yaml = load_yaml(moveit_config_pkg, 'config/stomp_planning.yaml')
-
-    # [ΝΕΟ] Ορίζουμε τον Pilz απευθείας στο Python (διορθωμένο για ROS 2)
     pilz_config = {
         'planning_plugin': 'pilz_industrial_motion_planner/CommandPlanner',
         'request_adapters': 'default_planning_request_adapters/ResolveConstraintFrames default_planning_request_adapters/ValidateWorkspaceBounds default_planning_request_adapters/CheckStartStateBounds default_planning_request_adapters/CheckStartStateCollision',
@@ -83,18 +73,15 @@ def generate_launch_description():
     }
 
     pipeline_config = {
-        # [ΑΛΛΑΓΗ] Προσθέσαμε το 'ompl_stomp' στη λίστα των ενεργών pipelines
         'planning_pipelines': ['ompl', 'pilz_industrial_motion_planner', 'ompl_stomp'],
         'default_planning_pipeline': 'ompl',
         'ompl': ompl_planning_yaml,
         'pilz_industrial_motion_planner': pilz_config,
-        # [ΑΛΛΑΓΗ] Ενώνουμε το νέο yaml με το όνομα του pipeline
         'ompl_stomp': ompl_stomp_planning_yaml 
     }
 
-    # =========================================================================
     # 4. Controllers Configuration
-    # =========================================================================
+    
     moveit_controllers = {
         'moveit_simple_controller_manager': {
             'controller_names': ['arm_controller', 'gripper_controller'],
@@ -123,9 +110,7 @@ def generate_launch_description():
 
     rviz_config_file = os.path.join(get_package_share_directory(moveit_config_pkg), 'config', 'moveit.rviz')
 
-    # =========================================================================
     # 5. Nodes
-    # =========================================================================
     
     # Joint State Publisher
     jsp_node = Node(
