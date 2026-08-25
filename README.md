@@ -77,8 +77,8 @@ vertical, with the wrist recovered in closed form.
 | [`launch/`](launch) | Launch files — fake robot, Gazebo, real arm |
 | [`config/`](config) | Kinematics, joint limits, OMPL settings |
 | [`GUI/`](GUI) | Tkinter operator interface |
-| [`3d_prints/`](3d_prints) | Custom gripper and fixtures (STL) |
-| `simple_move.cpp` | Motion node: interpolator, approach logic, MTC pipeline |
+| [`3d_prints/`](3d_prints) | Custom bases and flange (STL files) |
+| `simple_move.cpp` | Motion node |
 
 ---
 
@@ -87,7 +87,7 @@ vertical, with the wrist recovered in closed form.
 Built and tested on **Ubuntu 22.04 / ROS 2 Humble**, with MoveIt 2 and
 MoveIt Task Constructor built from source.
 
-Three mutually exclusive modes: fake robot (no hardware), Gazebo, and the real
+Three modes: fake robot (no hardware), Gazebo, and the real
 arm.
 
 ### Commands
@@ -95,7 +95,7 @@ arm.
 The GUI publishes on `/gui_commands`
 | Command | Action |
 | --- | --- |
-| `TASK <1-5>` | Full pick-and-carry pipeline for that tube |
+| `TASK <1-5>` | Full pipeline for each tube |
 | `m<0-6>` | Manual move to a marker |
 | `o` / `c` | Open / close gripper |
 | `p` | Pour |
@@ -103,11 +103,8 @@ The GUI publishes on `/gui_commands`
 
 ## Related
 
-The final packaged ROS 2 workspace lives in
-[**thesis-repo**](https://github.com/vkaratrantos/thesis-repo) — this
-repository is where the development happened.
-
----
+The final packaged ROS 2 workspace is in
+[**thesis-repo**](https://github.com/vkaratrantos/thesis-repo)
 
 ## Status
 
