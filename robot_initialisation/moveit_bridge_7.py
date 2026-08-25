@@ -12,14 +12,11 @@ class MoveItBridge(Node):
         super().__init__('moveit_bridge_node')
         self.get_logger().info('--- MoveIt Smart Bridge (Multi-Threaded) Started ---')
 
-        # --- THE FIX: Create a Callback Group for Multi-Threading ---
         self.cb_group = ReentrantCallbackGroup()
 
-        # 1. Publishers
         self.moveit_pub = self.create_publisher(JointState, '/joint_states', 10)
         self.driver_pub = self.create_publisher(JointState, '/hardware_joints', 10)
 
-        # 2. Action Servers (Assigned to the Multi-Threaded Group)
         self._arm_server = ActionServer(
             self,
             FollowJointTrajectory,
@@ -47,8 +44,6 @@ class MoveItBridge(Node):
         self.current_pos = [0.0] * 8 
         self.last_sent_pos = [999.0] * 8 
         self.last_sent_time = 0.0
-
-        # Assigned to the Multi-Threaded Group so it never gets blocked!
         self.timer = self.create_timer(0.02, self.publish_loop, callback_group=self.cb_group)
 
     def publish_loop(self):
@@ -66,7 +61,6 @@ class MoveItBridge(Node):
         
         should_send = False
         
-        # Traffic Control (10Hz max) + Highly sensitive Deadzone (0.0001)
         if time_diff > 0.05: 
             if diff > 0.0001: 
                 should_send = True
@@ -96,14 +90,11 @@ class MoveItBridge(Node):
             time_from_start = point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
             target_time = start_time + time_from_start
             
-            # Get starting positions for this specific movement segment
             start_positions = list(self.current_pos[:7])
             
-            # --- THE FIX: Linear Interpolation Loop ---
             now = time.time()
             segment_duration = target_time - now
             
-            # If the waypoint is more than 0.02s away, slice it up!
             if segment_duration > 0.02:
                 steps = int(segment_duration / 0.02)
                 for step in range(1, steps + 1):
@@ -112,10 +103,8 @@ class MoveItBridge(Node):
                         self.current_pos[i] = start_positions[i] + fraction * (target_positions[i] - start_positions[i])
                     time.sleep(0.02)
             else:
-                # If it's a tiny Cartesian step, just sleep the remainder
                 time.sleep(max(0.0, segment_duration))
             
-            # Ensure it snaps perfectly to the target at the very end of the waypoint
             for i in range(7):
                 self.current_pos[i] = target_positions[i]
 
@@ -135,8 +124,6 @@ class MoveItBridge(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = MoveItBridge()
-    
-    # --- THE FIX: Boot the node using multiple threads ---
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     
