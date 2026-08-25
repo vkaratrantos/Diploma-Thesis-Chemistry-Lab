@@ -11,9 +11,7 @@ class MoveItBridge(Node):
     def __init__(self):
         super().__init__('moveit_bridge_node')
         self.get_logger().info('--- MoveIt Smart Bridge (Multi-Threaded) Started ---')
-
         self.cb_group = ReentrantCallbackGroup()
-
         self.moveit_pub = self.create_publisher(JointState, '/joint_states', 10)
         self.driver_pub = self.create_publisher(JointState, '/hardware_joints', 10)
 
